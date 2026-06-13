@@ -1,0 +1,75 @@
+{
+  "manifest_version": 3,
+  "name": "Rumee — Auto Sync",
+  "version": "1.0.0",
+  "description": "Downloads Flipkart & Meesho reports and uploads directly to Google Drive.",
+
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "alarms",
+    "notifications",
+    "identity",
+    "downloads"
+  ],
+
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://supplier.meesho.com/*",
+        "https://seller.flipkart.com/*"
+      ],
+      "js": ["content/intercept.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://supplier.meesho.com/*"],
+      "js": ["config.js", "content/meesho.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://seller.flipkart.com/*"],
+      "js": ["config.js", "content/flipkart.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "oauth2": {
+    "client_id": "710811509279-kkk24q7hef0ctel8bi5b4fs6m3sn7g8r.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.file"
+    ]
+  },
+
+  "web_accessible_resources": [
+    {
+      "resources": ["log.html", "logger.js", "config.js"],
+      "matches":   ["<all_urls>"]
+    }
+  ],
+
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

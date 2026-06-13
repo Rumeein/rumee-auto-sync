@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rumee Sync</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <span class="logo">RUMEE</span>
+    <span class="subtitle">Auto Sync</span>
+  </div>
+
+  <!-- First-time setup screen (shown when no Drive folders are configured) -->
+  <div id="setupScreen" class="hidden">
+    <div class="setup-body">
+      <div class="setup-icon">☁</div>
+      <div class="setup-title">Welcome to Rumee Auto Sync</div>
+      <div class="setup-desc">This is your first install. Click below and the extension will automatically create all required folders in your Google Drive.</div>
+      <button id="createFoldersBtn" class="btn btn--primary setup-btn">Create My Drive Folders</button>
+      <div id="setupStatus" class="setup-status hidden"></div>
+    </div>
+  </div>
+
+  <!-- Main UI (hidden until setup is done) -->
+  <div id="mainUI">
+
+  <!-- Status banner -->
+  <div id="statusBanner" class="banner banner--idle">
+    <span id="statusIcon">⏸</span>
+    <span id="statusText">Idle</span>
+  </div>
+
+  <!-- Current job progress (shown during sync) -->
+  <div id="progressSection" class="section hidden">
+    <div class="section-title">IN PROGRESS</div>
+    <div id="currentJob" class="current-job">—</div>
+    <div id="queueCount" class="queue-count"></div>
+  </div>
+
+  <!-- Last run summary -->
+  <div class="section">
+    <div class="section-title">LAST RUN</div>
+    <div id="lastRunSummary" class="muted">Never run</div>
+  </div>
+
+  <!-- Job list -->
+  <div class="section">
+    <div class="section-title">FILES
+      <span class="select-all" id="selectAllBtn">select all</span>
+    </div>
+    <div id="jobList" class="job-list"><!-- populated by popup.js --></div>
+  </div>
+
+  <!-- Schedule -->
+  <div class="section">
+    <div class="section-title">DAILY SCHEDULE</div>
+    <div class="schedule-row">
+      <input type="time" id="scheduleTime" value="09:00">
+      <button id="saveScheduleBtn" class="btn btn--secondary">Save</button>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="actions">
+    <button id="runNowBtn" class="btn btn--primary">▶ Run selected now</button>
+    <button id="stopBtn"   class="btn btn--danger">■ Stop All Jobs</button>
+  </div>
+
+  <!-- Log link -->
+  <div class="log-link">
+    <a id="viewLogBtn" href="#">📋 View sync log</a>
+  </div>
+
+  </div><!-- /#mainUI -->
+
+  <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
