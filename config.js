@@ -30,6 +30,12 @@ const DRIVE_FOLDERS = {
   ME_ADS_CATALOG: '1VDrfDM5uy2Xs2E9XCR7Ijk1BBwh2pO2F',  // per-campaign per-day catalog detail
   ME_CLAIMS:   '1LX79E16fhxEF5kZGWmdXl4oNsVvqwspf',
   DOWNLOAD_MANIFEST: '1vvgGD0UEHwV6G3X4txTjghyshmuk7Ufa',  // Rumee Raw Data/Download Manifest
+  SYNC_LOG:          '1zqHbDZ20589xtFEaF921zX0ILoKhy8zO',  // Rumee Sync Logs/rumee_sync_log.csv
+};
+
+// ── Discord webhooks ──────────────────────────────────────────────────────────
+const DISCORD_WEBHOOKS = {
+  AUTO_SYNC: 'REPLACE_WITH_DISCORD_AUTOSYNC_WEBHOOK',
 };
 
 // ── Job definitions ───────────────────────────────────────────────────────────
@@ -60,14 +66,12 @@ const JOBS = [
   {
     id:        'fk_returns',
     platform:  'flipkart',
-    label:     'Flipkart Returns XLSX',
+    label:     'Flipkart Returns CSV',
     startUrl:  'https://seller.flipkart.com/',
     folderKey: 'FK_RETURNS',
-    filename:  'flipkart_returns.xlsx',
-    mimeType:  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    filename:  'flipkart_returns.csv',
+    mimeType:  'text/csv',
     frequency: 'daily',
-    reportType:    'Fulfilment Reports',
-    reportSubType: 'returns',
   },
   {
     id:        'fk_payments',
@@ -299,6 +303,34 @@ const JOBS = [
     folderKey: 'FK_VIEWS',
     filename:  'flipkart_views.xlsx',
     mimeType:  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    frequency: 'daily',
+  },
+  {
+    // Phase 2 of the FK Returns two-phase flow. Runs near the END of the sync —
+    // by now the return report requested by fk_returns (~30-60 min ago) should
+    // be Generated. Navigates to All Returns page, opens Previous Downloads panel,
+    // finds the matching row, intercepts Download click, fetches and uploads CSV.
+    id:        'fk_returns_download',
+    platform:  'flipkart',
+    label:     'FK Returns — Download',
+    startUrl:  'https://seller.flipkart.com/',
+    folderKey: 'FK_RETURNS',
+    filename:  'flipkart_returns.csv',
+    mimeType:  'text/csv',
+    frequency: 'daily',
+  },
+  {
+    // Phase 2 of FK Listings two-phase flow. Runs just before fk_keywords —
+    // by now the file triggered by fk_listings (~30-60 min ago) should be ready.
+    // Opens View Recent Downloads, finds the Listing file, downloads and uploads.
+    // If still Generating: schedules fk_listings_recheck alarm (60 min, max 3x).
+    id:        'fk_listings_download',
+    platform:  'flipkart',
+    label:     'FK Listings -- Download',
+    startUrl:  'https://seller.flipkart.com/',
+    folderKey: 'FK_LISTINGS',
+    filename:  'flipkart_listings.xls',
+    mimeType:  'application/vnd.ms-excel',
     frequency: 'daily',
   },
   {

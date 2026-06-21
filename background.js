@@ -2,7 +2,7 @@
 // MV3 service worker: sleeps between alarms. ALL state lives in
 // chrome.storage.local so we survive sleep/wake cycles mid-job.
 
-importScripts('config.js', 'logger.js', 'drive/upload.js');
+importScripts('config.js', 'logger.js', 'drive/upload.js', 'bulk/bulk-handler.js');
 
 const ALARM_NAME     = 'rumee-daily-sync';
 const KEEPALIVE_ALARM = 'rumee_keepalive';   // wakes SW every 2 min → watchdog can fire on time
@@ -38,16 +38,10 @@ let _logQueue = Promise.resolve();
 
 // ─── Alarm setup ─────────────────────────────────────────────────────────────
 
-chrome.runtime.onInstalled.addListener(async (details) => {
-  if (details.reason === 'install') {
-    // Fresh install — show setup screen before first use
-    await chrome.storage.local.set({ needsSetup: true });
-  } else if (details.reason === 'update') {
-    // Existing install upgrading — migrate hardcoded folder IDs to storage
-    const { customFolders } = await chrome.storage.local.get('customFolders');
-    if (!customFolders) {
-      await chrome.storage.local.set({ customFolders: { ...DRIVE_FOLDERS }, needsSetup: false });
-    }
+chrome.runtime.onInstalled.addListener(async () => {
+  const { customFolders } = await chrome.storage.local.get('customFolders');
+  if (!customFolders) {
+    await chrome.storage.local.set({ customFolders: { ...DRIVE_FOLDERS }, needsSetup: false });
   }
 
   await scheduleAlarm();
@@ -57,7 +51,9 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   // a reload reliably stops self-triggered re-navigation from old runs.
   await chrome.alarms.clear('fk_rc_recheck');
   await chrome.alarms.clear('fk_views_recheck');
-  await chrome.storage.local.remove(['fk_rc_recheck_count', 'fk_views_recheck_count']);
+  await chrome.alarms.clear('fk_returns_recheck');
+  await chrome.alarms.clear('fk_listings_recheck');
+  await chrome.storage.local.remove(['fk_rc_recheck_count', 'fk_views_recheck_count', 'fk_returns_recheck_count', 'fk_listings_recheck_count', 'fk_listings_gen_date']);
 
   // Reinject isolated-world content scripts into any already-open tabs.
   // After extension reload, existing tabs' content scripts are invalidated — relay
@@ -143,6 +139,8 @@ async function scheduleAlarm() {
  * Builds a job queue, stores it, then starts processing.
  */
 async function startSync(manualJobIds = null) {
+  const { bulkRunning } = await chrome.storage.local.get('bulkRunning');
+  if (bulkRunning) { console.log('[Rumee] Bulk sync running — daily sync skipped'); return; }
   const running = await isRunning();
   if (running) {
     console.log('[Rumee] Sync already in progress — skipping');
@@ -406,6 +404,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Schedule a 1-hour alarm to recheck FK Returns download
+  if (msg.type === 'SCHEDULE_FK_RETURNS_RECHECK') {
+    chrome.alarms.create('fk_returns_recheck', { delayInMinutes: msg.delayMinutes || 60 });
+    console.log(`[Rumee] Scheduled fk_returns_recheck in ${msg.delayMinutes || 60} min`);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // Schedule a 1-hour alarm to recheck FK Listings download
+  if (msg.type === 'SCHEDULE_FK_LISTINGS_RECHECK') {
+    chrome.alarms.create('fk_listings_recheck', { delayInMinutes: msg.delayMinutes || 60 });
+    console.log(`[Rumee] Scheduled fk_listings_recheck in ${msg.delayMinutes || 60} min`);
+    sendResponse({ ok: true });
+    return true;
+  }
+
   // Content script completed job without uploading a file (e.g. requestOnly jobs
   // that just submit a request and move on, or fk_rc_download after downloading sub-jobs).
   if (msg.type === 'JOB_DONE') {
@@ -488,8 +502,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Persist the dated filename override so the slow-path onCreated handler
     // (after a service worker wake-up) can still use the correct dated name.
     if (msg.filenameOverride) {
-      chrome.storage.local.set({ _pendingFilenameOverride: msg.filenameOverride });
+      // Await the write before responding so signalDownloadExpected only resolves
+      // after the override is durably stored — prevents the slow path reading a
+      // stale value from the previous job if the SW sleeps before the set completes.
+      chrome.storage.local.set({ _pendingFilenameOverride: msg.filenameOverride }, () => {
+        sendResponse({ ok: true });
+      });
+    } else {
+      sendResponse({ ok: true });
     }
+    return true;
+  }
+
+  // Backfill pages arm the download interceptor before clicking the download button.
+  if (msg.type === 'BACKFILL_ARM') {
+    _backfillDownload = { filename: msg.filename, folderKey: msg.folderKey, mimeType: msg.mimeType };
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === 'BACKFILL_DISARM') {
+    _backfillDownload = null;
+    chrome.storage.local.remove('backfillDownloadResult');
     sendResponse({ ok: true });
     return true;
   }
@@ -554,9 +587,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       await chrome.alarms.clear('fk_rc_recheck');
       await chrome.alarms.clear('fk_views_recheck');
+      await chrome.alarms.clear('fk_returns_recheck');
+      await chrome.alarms.clear('fk_listings_recheck');
       await chrome.storage.local.set({ syncRunning: false, syncQueue: [] });
       await chrome.storage.local.remove([
         'currentJobId', 'fk_rc_recheck_count', 'fk_views_recheck_count',
+        'fk_returns_recheck_count', 'fk_listings_recheck_count', 'fk_listings_gen_date',
       ]);
       console.log('[Rumee] KILL ALL — sync aborted + recheck alarms cleared');
       sendResponse({ ok: true });
@@ -573,6 +609,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 });
+
+// FK API test page — supplies Basic Auth credentials to prevent Chrome's native auth dialog.
+// Fires when api.flipkart.net returns 401 + WWW-Authenticate. Reads credentials stored by the
+// test page before each request. Scoped strictly to api.flipkart.net — no effect on seller.flipkart.com.
+chrome.webRequest.onAuthRequired.addListener(
+  (details, callback) => {
+    chrome.storage.local.get(['fkApiKey', 'fkApiSecret'], ({ fkApiKey, fkApiSecret }) => {
+      if (fkApiKey && fkApiSecret) {
+        callback({ authCredentials: { username: fkApiKey, password: fkApiSecret } });
+      } else {
+        callback({});
+      }
+    });
+  },
+  { urls: ['https://api.flipkart.net/*'] },
+  ['asyncBlocking']
+);
 
 /**
  * Content script loaded on the right page — tell it which job to run.
@@ -818,6 +871,40 @@ async function finishSync(done, failed) {
   // later recheck (RC reports / FK views) lands the file. Never blocks the sync.
   try { await verifyAndLogManifest(); }
   catch (e) { logError('verify', `manifest verification failed: ${e.message}`); }
+
+  try { await flushLogToDrive(); }
+  catch (e) { console.error('[Rumee] Drive log flush failed:', e); }
+}
+
+// ─── Drive log flush ──────────────────────────────────────────────────────────
+// At the end of every sync, appends this run's log entries to a single rolling
+// CSV file in Drive (rumee_sync_log.csv). Creates the file on first run.
+// Non-fatal — failure is logged to console only and never blocks the sync.
+async function flushLogToDrive() {
+  const LOG_FILENAME = 'rumee_sync_log.csv';
+  const HEADER       = 'ts,jobId,level,msg\n';
+
+  const { rumeeLog = [], syncStarted } = await chrome.storage.local.get(['rumeeLog', 'syncStarted']);
+  const cutoff = syncStarted || 0;
+  const entries = rumeeLog.filter(e => new Date(e.ts).getTime() >= cutoff);
+  if (entries.length === 0) return;
+
+  const csvEscape = s => `"${String(s ?? '').replace(/"/g, '""')}"`;
+  const csvRows   = entries.map(e => [e.ts, e.jobId, e.level, csvEscape(e.msg)].join(',')).join('\n') + '\n';
+
+  const token    = await getDriveToken(false);
+  const folderId = DRIVE_FOLDERS.SYNC_LOG;
+  const existing = await searchDriveFile(token, folderId, LOG_FILENAME);
+
+  if (existing) {
+    const current   = await downloadDriveFileText(token, existing.id);
+    const appended  = current.trimEnd() + '\n' + csvRows;
+    await updateDriveFile(token, existing.id, new TextEncoder().encode(appended).buffer, 'text/csv');
+  } else {
+    await uploadToDrive(new TextEncoder().encode(HEADER + csvRows).buffer, LOG_FILENAME, folderId, 'text/csv');
+  }
+
+  logInfo('system', `✓ Log flushed to Drive (${entries.length} entries)`);
 }
 
 async function isRunning() {
@@ -976,6 +1063,28 @@ async function handleUploadDataSilent({ jobId, data, filename, folderKey, mimeTy
   } catch (err) {
     logError(jobId, `✗ Silent upload failed: ${err.message}`);
     return false;
+  }
+}
+
+// ─── Backfill download-URL handler (fetches URL, extracts ZIP if needed, uploads) ─
+
+async function handleDownloadUrlCapturedSilent({ url, filename, folderKey, mimeType }) {
+  try {
+    const isCdn = CDN_DOMAINS.test(url);
+    const res = await fetch(url, { credentials: isCdn ? 'omit' : 'include' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('text/html')) throw new Error('Portal returned HTML — SameSite blocked');
+    const buffer = await res.arrayBuffer();
+    const { buffer: upBuf, filename: upName, mimeType: upMime } = await extractZipIfNeeded(buffer, filename, mimeType);
+    const folderId = DRIVE_FOLDERS[folderKey];
+    if (!folderId) throw new Error(`No folder for key "${folderKey}"`);
+    const driveFile = await uploadToDrive(upBuf, upName, folderId, upMime);
+    console.log(`[Rumee] Backfill uploaded "${upName}" (${(upBuf.byteLength / 1024).toFixed(1)} KB) — ${driveFile.id}`);
+    return { ok: true, filename: upName, bytes: upBuf.byteLength };
+  } catch (err) {
+    console.error(`[Rumee] Backfill upload failed:`, err);
+    return { ok: false, error: err.message };
   }
 }
 
@@ -1148,6 +1257,8 @@ async function closeCurrentTab() {
 // button.  This keeps the service worker alive AND pre-loads the job so the
 // onCreated handler can cancel synchronously — no async storage read needed.
 let _pendingDownloadJob = null;
+// Backfill download: armed by BACKFILL_ARM, cleared after first use
+let _backfillDownload = null;
 
 // ─── Chrome download interceptor ─────────────────────────────────────────────
 //
@@ -1166,6 +1277,17 @@ let _pendingDownloadJob = null;
 // job is actively running). User-initiated downloads outside a sync are untouched.
 
 chrome.downloads.onCreated.addListener((item) => {
+  // ── BACKFILL PATH — standalone backfill pages ─────────────────────────────
+  if (_backfillDownload) {
+    const bf = _backfillDownload;
+    _backfillDownload = null;
+    chrome.downloads.cancel(item.id, () => { chrome.downloads.erase({ id: item.id }, () => {}); });
+    console.log(`[Rumee] downloads.onCreated (backfill): ${item.url.slice(0, 120)}`);
+    handleDownloadUrlCapturedSilent({ url: item.url, ...bf })
+      .then(result => chrome.storage.local.set({ backfillDownloadResult: result }));
+    return;
+  }
+
   // ── FAST PATH ──────────────────────────────────────────────────────────────
   // Content script sent DOWNLOAD_BUTTON_CLICKED just before the click, which
   // (a) kept the service worker alive, and (b) set _pendingDownloadJob.
@@ -1174,6 +1296,7 @@ chrome.downloads.onCreated.addListener((item) => {
   if (_pendingDownloadJob) {
     const job = _pendingDownloadJob;
     _pendingDownloadJob = null; // consumed
+    chrome.storage.local.remove('_pendingFilenameOverride'); // prevent stale value reaching next job's slow path
 
     console.log(`[Rumee] downloads.onCreated (fast): intercepting for ${job.id} — ${item.url.slice(0, 120)}`);
     logInfo(job.id, `↓ Intercepted download: ${item.url.slice(0, 120)}`);
@@ -1362,6 +1485,26 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   await startSync(['fk_views']);
 });
 
+// ─── FK Returns Recheck Alarm ─────────────────────────────────────────────────
+// Fires 1 hour after fk_returns_download found the report still Pending.
+// Re-triggers fk_returns_download to check again and download if Ready.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'fk_returns_recheck') return;
+  console.log('[Rumee] fk_returns_recheck alarm fired — running FK Returns download check');
+  notify('Rumee — FK Returns Recheck', 'Checking if FK Returns report is ready...');
+  await startSync(['fk_returns_download']);
+});
+
+// ─── FK Listings Recheck Alarm ────────────────────────────────────────────────
+// Fires 1 hour after fk_listings_download found the file still Generating.
+// Re-triggers fk_listings_download to check again and download if ready.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'fk_listings_recheck') return;
+  console.log('[Rumee] fk_listings_recheck alarm fired — running FK Listings download check');
+  notify('Rumee — FK Listings Recheck', 'Checking if FK Listings file is ready...');
+  await startSync(['fk_listings_download']);
+});
+
 // ─── Download Manifest: verify every expected file landed in Drive ────────────
 //
 // Detection is by Drive PRESENCE (not job success): for each expected slot we
@@ -1487,5 +1630,27 @@ async function verifyAndLogManifest() {
   else          await uploadToDrive(buffer, filename, folderId, 'text/csv');
 
   logSuccess('verify', `Manifest: ${verified} verified, ${missing} missing (data date ${dataDate})`);
+
+  // ── Post summary to Discord #auto-sync ────────────────────────────────────
+  try {
+    const verifiedList = results.filter(r => r.status === 'Verified').map(r => r.fileName);
+    const missingList  = results.filter(r => r.status === 'Missing').map(r => r.fileName);
+    const lines = [`**AutoSync complete — ${runDate}**`];
+    if (missingList.length) {
+      lines.push(`✅ ${verifiedList.length}/${results.length} verified`);
+      lines.push(`❌ Missing (${missingList.length}): ${missingList.join(', ')}`);
+      lines.push(`_Pipeline runs at 6:30 PM IST. Upload missing files to Drive before then._`);
+    } else {
+      lines.push(`✅ All ${results.length}/${results.length} files verified. Pipeline runs at 6:30 PM IST.`);
+    }
+    await fetch(DISCORD_WEBHOOKS.AUTO_SYNC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: lines.join('\n') }),
+    });
+  } catch (e) {
+    logError('verify', `Discord notify failed: ${e.message}`);
+  }
+
   return { verified, missing };
 }
