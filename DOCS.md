@@ -13,23 +13,24 @@
 3. [Technical Architecture](#3-technical-architecture)
 4. [Extension File Structure](#4-extension-file-structure)
 5. [How a Job Runs — End to End](#5-how-a-job-runs--end-to-end)
-6. [Configuration Reference (config.js)](#6-configuration-reference-configjs)
-7. [Meesho Reports — Detailed Reference](#7-meesho-reports--detailed-reference)
-8. [Flipkart Reports — Detailed Reference](#8-flipkart-reports--detailed-reference)
-9. [Google Drive Folder Structure](#9-google-drive-folder-structure)
-10. [Download Mechanisms](#10-download-mechanisms)
-11. [Bot Detection & Human-like Behavior](#11-bot-detection--human-like-behavior)
-12. [Session Recovery](#12-session-recovery)
-13. [Installation & Setup Guide](#13-installation--setup-guide)
-14. [Flipkart Scheduled Reports Setup](#14-flipkart-scheduled-reports-setup)
-15. [Operating the Extension (Daily Use)](#15-operating-the-extension-daily-use)
-16. [What the Pipeline Receives](#16-what-the-pipeline-receives)
-17. [Known Issues & Pending Actions](#17-known-issues--pending-actions)
-18. [How to Add a New Report](#18-how-to-add-a-new-report)
-19. [Multi-Account & Multi-Business Use](#19-multi-account--multi-business-use)
-20. [Chrome Web Store Publishing (Future Reference)](#20-chrome-web-store-publishing-future-reference)
-21. [Glossary](#21-glossary)
-22. [Flipkart UI Internals & Timing Behavior](#22-flipkart-ui-internals--timing-behavior)
+6. [Secrets Management](#6-secrets-management)
+7. [Configuration Reference (config.js)](#7-configuration-reference-configjs)
+8. [Meesho Reports — Detailed Reference](#8-meesho-reports--detailed-reference)
+9. [Flipkart Reports — Detailed Reference](#9-flipkart-reports--detailed-reference)
+10. [Google Drive Folder Structure](#10-google-drive-folder-structure)
+11. [Download Mechanisms](#11-download-mechanisms)
+12. [Bot Detection & Human-like Behavior](#12-bot-detection--human-like-behavior)
+13. [Session Recovery](#13-session-recovery)
+14. [Installation & Setup Guide](#14-installation--setup-guide)
+15. [Flipkart Scheduled Reports Setup](#15-flipkart-scheduled-reports-setup)
+16. [Operating the Extension (Daily Use)](#16-operating-the-extension-daily-use)
+17. [What the Pipeline Receives](#17-what-the-pipeline-receives)
+18. [Known Issues & Pending Actions](#18-known-issues--pending-actions)
+19. [How to Add a New Report](#19-how-to-add-a-new-report)
+20. [Multi-Account & Multi-Business Use](#20-multi-account--multi-business-use)
+21. [Chrome Web Store Publishing (Future Reference)](#21-chrome-web-store-publishing-future-reference)
+22. [Glossary](#22-glossary)
+23. [Flipkart UI Internals & Timing Behavior](#23-flipkart-ui-internals--timing-behavior)
 
 ---
 
@@ -177,6 +178,14 @@ rumee-extension/
 ├── manifest.json          Chrome Extension manifest v3
 │                          Declares permissions, content scripts, OAuth config
 │
+├── secrets.js             ⭐ GITIGNORED — local machine only
+│                          All secrets: DISCORD_WEBHOOKS, FLIPKART_API_SECRET
+│                          Loaded first in background.js (importScripts) and
+│                          fk-api-test.html. Never commit this file.
+│                          Copy from secrets.example.js to create on a new machine.
+│
+├── secrets.example.js     Template with placeholder values — committed to git
+│
 ├── config.js              ⭐ THE MOST IMPORTANT FILE
 │                          Single source of truth for ALL job definitions and
 │                          Drive folder IDs. Edit ONLY this file to add/remove
@@ -301,7 +310,55 @@ if (syncRunning) {
 
 ---
 
-## 6. Configuration Reference (config.js)
+## 6. Secrets Management
+
+All secrets live in `secrets.js` — gitignored, never committed, exists only on the local machine.
+
+### File: `secrets.js` (gitignored — local only)
+
+```javascript
+const DISCORD_WEBHOOKS = {
+  AUTO_SYNC: 'https://discord.com/api/webhooks/...',  // #auto-sync channel
+};
+
+const FLIPKART_API_SECRET = '12b66c...';  // Flipkart Seller API secret
+```
+
+### File: `secrets.example.js` (committed — placeholder values only)
+
+Template. Copy to `secrets.js` on a new machine and fill in real values.
+
+### How secrets are loaded
+
+| Consumer | How |
+|---|---|
+| `background.js` | `importScripts('secrets.js', 'config.js', ...)` — loaded first, available globally |
+| `fk-api-test.html` | `<script src="secrets.js">` before `fk-api-test.js` — secret field auto-populated |
+| Content scripts (meesho.js, flipkart.js) | Do NOT use secrets — they only use DRIVE_FOLDERS and JOBS from config.js |
+
+### What each secret is for
+
+| Secret | Purpose |
+|---|---|
+| `DISCORD_WEBHOOKS.AUTO_SYNC` | Posts sync completion summary to Rumee Discord #auto-sync channel |
+| `FLIPKART_API_SECRET` | Flipkart Seller API authentication — used in fk-api-test tool and future direct API calls |
+
+### Setting up on a new machine
+
+```
+1. Copy secrets.example.js → secrets.js
+2. Fill in real values (get from Jaiswal or password manager)
+3. Reload extension in chrome://extensions
+4. Never commit secrets.js
+```
+
+### Why this pattern exists
+
+Before June 2026, `DISCORD_WEBHOOKS` was hardcoded in `config.js` and committed to the public GitHub repo. GitGuardian flagged the webhook URL twice. After the second incident, secrets were moved to this gitignored file permanently.
+
+---
+
+## 7. Configuration Reference (config.js)
 
 `config.js` is loaded by both `background.js` (via `importScripts`) and content scripts (via manifest `js` array). **Any change to jobs or folder IDs must be made only in this file.**
 
@@ -343,7 +400,7 @@ Each job object has these fields:
 
 ---
 
-## 7. Meesho Reports — Detailed Reference
+## 8. Meesho Reports — Detailed Reference
 
 ### Overview of Meesho Navigation Pattern
 
@@ -608,7 +665,7 @@ Read the date from the page label — do not assume it is today's date. The data
 
 ---
 
-## 8. Flipkart Reports — Detailed Reference
+## 9. Flipkart Reports — Detailed Reference
 
 ### Overview of Flipkart Navigation
 
@@ -951,7 +1008,7 @@ LK6JHJG7DMZ8, PLA_Campaign-2026-05-29, 2026-05-29, 970.50, 32163, 647, 2, 623.00
 
 ---
 
-## 9. Google Drive Folder Structure
+## 10. Google Drive Folder Structure
 
 ```
 Google Drive (rumeein@gmail.com)
@@ -1020,7 +1077,7 @@ await uploadToDrive(fileBuffer, job.filename, folderId, job.mimeType);
 
 ---
 
-## 10. Download Mechanisms
+## 11. Download Mechanisms
 
 Different reports use different download methods. The content script uses the appropriate method for each:
 
@@ -1094,7 +1151,7 @@ Different reports use different download methods. The content script uses the ap
 
 ---
 
-## 11. Bot Detection & Human-like Behavior
+## 12. Bot Detection & Human-like Behavior
 
 ### Meesho — Akamai Bot Manager
 
@@ -1124,7 +1181,7 @@ No significant bot detection observed. Direct URL navigation works fine.
 
 ---
 
-## 12. Session Recovery
+## 13. Session Recovery
 
 If the extension is mid-job and the portal redirects to the login page (session expired):
 
@@ -1144,7 +1201,7 @@ Similar approach. If Flipkart session expires mid-job, attempt autofill login on
 
 ---
 
-## 13. Installation & Setup Guide
+## 14. Installation & Setup Guide
 
 ### Prerequisites
 
@@ -1208,7 +1265,7 @@ Each Google account (Chrome profile) authorizes independently. The extension onl
 
 ---
 
-## 14. Flipkart Scheduled Reports Setup
+## 15. Flipkart Scheduled Reports Setup
 
 Three Flipkart reports are configured as daily scheduled reports. **This only needs to be set up once.** Once active, Flipkart generates them automatically every day.
 
@@ -1235,7 +1292,7 @@ For each report:
 
 ---
 
-## 15. Operating the Extension (Daily Use)
+## 16. Operating the Extension (Daily Use)
 
 ### Automatic (no action needed)
 
@@ -1270,7 +1327,7 @@ Popup → Schedule section → change hour/minute → Save. The alarm is recreat
 
 ---
 
-## 16. What the Pipeline Receives
+## 17. What the Pipeline Receives
 
 The extension's job ends when the file lands in Drive. A separate pipeline (not part of this extension) processes the files. Here is what the pipeline can expect:
 
@@ -1316,7 +1373,7 @@ The extension uploads files using the `filename` from each job's config.js defin
 
 ---
 
-## 17. Known Issues & Pending Actions
+## 18. Known Issues & Pending Actions
 
 | Priority | Issue | Detail | Action |
 |---|---|---|---|
@@ -1331,7 +1388,7 @@ The extension uploads files using the `filename` from each job's config.js defin
 
 ---
 
-## 18. How to Add a New Report
+## 19. How to Add a New Report
 
 1. **Identify the report** — which portal, which section, what download mechanism
 
@@ -1378,7 +1435,7 @@ The extension uploads files using the `filename` from each job's config.js defin
 
 ---
 
-## 19. Multi-Account & Multi-Business Use
+## 20. Multi-Account & Multi-Business Use
 
 ### How Google Accounts Work
 
@@ -1413,7 +1470,7 @@ When you update the extension from an older version (one without the setup wizar
 
 ---
 
-## 20. Chrome Web Store Publishing (Future Reference)
+## 21. Chrome Web Store Publishing (Future Reference)
 
 This section documents what is needed if the extension is ever published to the Chrome Web Store. Nothing here needs to be done now.
 
@@ -1464,7 +1521,7 @@ Google takes 30% of any payment made through the Chrome Web Store. You receive 7
 
 ---
 
-## 21. Glossary
+## 22. Glossary
 
 | Term | Full Form | Meaning in context |
 |---|---|---|
@@ -1493,7 +1550,7 @@ Google takes 30% of any payment made through the Chrome Web Store. You receive 7
 
 ---
 
-## 22. Flipkart UI Internals & Timing Behavior
+## 23. Flipkart UI Internals & Timing Behavior
 
 This section documents hard-won knowledge about how specific Flipkart UI elements behave and timing constraints that affect automation reliability. Recorded from debugging sessions in June 2026.
 
