@@ -11,7 +11,9 @@
     "alarms",
     "notifications",
     "identity",
-    "downloads"
+    "downloads",
+    "webRequest",
+    "webRequestAuthProvider"
   ],
 
   "host_permissions": [
@@ -62,7 +64,7 @@
 
   "web_accessible_resources": [
     {
-      "resources": ["log.html", "logger.js", "config.js"],
+      "resources": ["log.html", "logger.js", "secrets.js", "config.js"],
       "matches":   ["<all_urls>"]
     }
   ],

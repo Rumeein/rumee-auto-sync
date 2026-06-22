@@ -33,11 +33,6 @@ const DRIVE_FOLDERS = {
   SYNC_LOG:          '1zqHbDZ20589xtFEaF921zX0ILoKhy8zO',  // Rumee Sync Logs/rumee_sync_log.csv
 };
 
-// ── Discord webhooks ──────────────────────────────────────────────────────────
-const DISCORD_WEBHOOKS = {
-  AUTO_SYNC: 'https://discord.com/api/webhooks/1518202865481683026/2ghWQGt3jHdoTx3pCjxgH0lyeKr5dINK9-14MfOEUy-TxcTc7Y38LeJrHvWK5c849iRW',
-};
-
 // ── Job definitions ───────────────────────────────────────────────────────────
 // frequency:
 //   'daily'   — run every day

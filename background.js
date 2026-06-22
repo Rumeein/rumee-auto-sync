@@ -2,7 +2,7 @@
 // MV3 service worker: sleeps between alarms. ALL state lives in
 // chrome.storage.local so we survive sleep/wake cycles mid-job.
 
-importScripts('config.js', 'logger.js', 'drive/upload.js', 'bulk/bulk-handler.js');
+importScripts('secrets.js', 'config.js', 'logger.js', 'drive/upload.js', 'bulk/bulk-handler.js');
 
 const ALARM_NAME     = 'rumee-daily-sync';
 const KEEPALIVE_ALARM = 'rumee_keepalive';   // wakes SW every 2 min → watchdog can fire on time

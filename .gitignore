@@ -1,2 +1,6 @@
 *.backup_*
 recording.md
+
+# Secrets — NEVER commit
+secrets.js
+*.txt
