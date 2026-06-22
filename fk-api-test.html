@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>FK Seller API — Test</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: monospace; padding: 24px; background: #1a1a1a; color: #e0e0e0; margin: 0; }
+    h2  { color: #90caf9; margin: 0 0 4px; }
+    h3  { color: #80cbc4; margin: 16px 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; }
+    p   { color: #aaa; margin: 0 0 12px; font-size: 12px; }
+
+    .section { background: #222; border: 1px solid #333; border-radius: 6px; padding: 14px 16px; margin-bottom: 14px; }
+
+    label   { color: #ccc; font-size: 13px; display: block; margin-bottom: 4px; }
+    input[type="text"], input[type="password"], select, textarea {
+      background: #111; color: #e0e0e0; border: 1px solid #444;
+      padding: 5px 8px; border-radius: 4px; font-family: monospace;
+      font-size: 13px; width: 100%;
+    }
+    input[type="text"]:focus, input[type="password"]:focus, select:focus, textarea:focus {
+      outline: none; border-color: #2196f3;
+    }
+    .row    { display: flex; gap: 10px; align-items: flex-end; margin-bottom: 10px; }
+    .row .field { flex: 1; }
+    .row .field-fixed { flex: 0 0 auto; }
+
+    button {
+      padding: 7px 18px; cursor: pointer; border: none;
+      border-radius: 4px; font-size: 13px; font-family: monospace; white-space: nowrap;
+    }
+    button:disabled { opacity: 0.4; cursor: default; }
+    .btn-blue  { background: #2196f3; color: white; }
+    .btn-green { background: #388e3c; color: white; }
+    .btn-grey  { background: #444; color: #ccc; }
+    .btn-small { padding: 4px 12px; font-size: 12px; }
+
+    .status-bar {
+      font-size: 12px; padding: 6px 10px; border-radius: 4px; margin-top: 8px;
+      border: 1px solid #333;
+    }
+    .status-ok   { background: #1b3a1f; border-color: #4caf50; color: #81c784; }
+    .status-err  { background: #3a1b1b; border-color: #f44336; color: #ef9a9a; }
+    .status-idle { background: #1a1a1a; border-color: #444;    color: #666;    }
+
+    .endpoint-grid {
+      display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+    }
+    .endpoint-grid button { padding: 5px 12px; font-size: 12px; }
+
+    #responseBox {
+      background: #111; border: 1px solid #333; border-radius: 4px;
+      padding: 10px; font-size: 12px; color: #ccc; white-space: pre-wrap;
+      word-break: break-all; max-height: 420px; overflow-y: auto;
+      margin-top: 8px; min-height: 60px;
+    }
+
+    #log {
+      background: #111; border: 1px solid #333; border-radius: 4px;
+      padding: 8px 10px; font-size: 11px; color: #777; white-space: pre-wrap;
+      max-height: 140px; overflow-y: auto; margin-top: 8px;
+    }
+
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }
+    .badge-ok  { background: #1b3a1f; color: #81c784; }
+    .badge-err { background: #3a1b1b; color: #ef9a9a; }
+
+    .params-area { margin-top: 8px; }
+    .params-area textarea { height: 70px; resize: vertical; }
+
+    .hint { font-size: 11px; color: #555; margin-top: 3px; }
+  </style>
+</head>
+<body>
+  <h2>FK Seller API — Test Lab</h2>
+  <p>Standalone test — does not touch any sync code. Open as chrome-extension://…/fk-api-test.html</p>
+
+  <!-- ── 1. Credentials ── -->
+  <div class="section">
+    <h3>1. Credentials</h3>
+    <div class="row">
+      <div class="field">
+        <label>API Key (Client ID)</label>
+        <input type="text" id="apiKey" placeholder="1873a36735aa…" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>Secret</label>
+        <input type="password" id="apiSecret" placeholder="paste secret here" autocomplete="off">
+      </div>
+      <div class="field-fixed">
+        <button class="btn-blue" id="tokenBtn">Get Token</button>
+      </div>
+    </div>
+    <div class="row" style="margin-bottom:0">
+      <div class="field">
+        <label>Scope <span class="hint">(space-separated; try blank first for default)</span></label>
+        <input type="text" id="scopeInput" value="Seller_Api" autocomplete="off">
+      </div>
+    </div>
+    <div class="status-bar status-idle" id="tokenStatus">No token yet</div>
+  </div>
+
+  <!-- ── 2. Endpoint Presets ── -->
+  <div class="section">
+    <h3>2. Test Endpoint</h3>
+    <p>Quick presets — click to populate URL, then hit Send.</p>
+    <div class="endpoint-grid">
+      <button class="btn-grey btn-small" data-preset="orders">Orders</button>
+      <button class="btn-grey btn-small" data-preset="returns">Returns</button>
+      <button class="btn-grey btn-small" data-preset="payments">Payments</button>
+      <button class="btn-grey btn-small" data-preset="listings">Listings</button>
+      <button class="btn-grey btn-small" data-preset="shipments">Shipments</button>
+      <button class="btn-grey btn-small" data-preset="skus">SKUs</button>
+      <button class="btn-grey btn-small" data-preset="notifications">Notifications</button>
+    </div>
+
+    <div class="row">
+      <div class="field-fixed">
+        <label>Method</label>
+        <select id="method" style="width:80px">
+          <option>GET</option>
+          <option>POST</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>URL</label>
+        <input type="text" id="endpointUrl" placeholder="https://api.flipkart.net/sellers/orders/v2" autocomplete="off">
+      </div>
+    </div>
+
+    <div class="params-area">
+      <label>Query params / request body <span class="hint">(JSON for POST; key=value lines for GET query string; leave blank to skip)</span></label>
+      <textarea id="paramsArea" placeholder='{"filter": "created", "created_from": "2026-06-01", "created_to": "2026-06-01"}'></textarea>
+    </div>
+
+    <div style="margin-top:8px; display:flex; gap:8px; align-items:center">
+      <button class="btn-green" id="sendBtn">Send Request</button>
+      <button class="btn-grey btn-small" id="clearBtn">Clear</button>
+      <span id="reqStatus" style="font-size:12px; color:#666"></span>
+    </div>
+
+    <div id="responseBox">— response will appear here —</div>
+  </div>
+
+  <!-- ── 3. Log ── -->
+  <div class="section">
+    <h3>Log</h3>
+    <div id="log"></div>
+  </div>
+
+  <script src="secrets.js"></script>
+  <script src="fk-api-test.js"></script>
+</body>
+</html>
