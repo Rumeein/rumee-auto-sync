@@ -365,9 +365,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
           // Option 5: set campaign cache before advancing to next job
           if (jobId === 'fk_ads_daily') await _setFkAdsDailyCacheFromBuffer(jobId, filename, buf.buffer);
+          const { buffer: upBuf, filename: upName, mimeType: upMime } = await extractZipIfNeeded(buf.buffer, filename, mimeType);
           const folderId = DRIVE_FOLDERS[folderKey];
-          const driveFile = await uploadToDrive(buf.buffer, filename, folderId, mimeType);
-          logSuccess(jobId, `✓ Uploaded "${filename}" (CS fetch) to Drive (${(buf.length / 1024).toFixed(1)} KB) — file ID: ${driveFile.id}`);
+          const driveFile = await uploadToDrive(upBuf, upName, folderId, upMime);
+          logSuccess(jobId, `✓ Uploaded "${upName}" (CS fetch) to Drive (${(upBuf.byteLength / 1024).toFixed(1)} KB) — file ID: ${driveFile.id}`);
           await markJobResult(jobId, true);
         } catch (err) {
           logError(jobId, `✗ CS upload failed: ${err.message}`);
@@ -935,12 +936,18 @@ function notify(title, message) {
 }
 
 // ─── ZIP extraction helper ────────────────────────────────────────────────────
+// Only called when mimeType === 'application/zip' (currently: me_payments only).
+// Removed: PK\x03\x04 magic byte check that previously guarded this function.
+// That check became dead code once the mimeType guard above was added — XLSX files
+// are also ZIP archives (ECMA-376) and share the same magic bytes, so the magic
+// check alone was what caused XLSX corruption. mimeType from config.js is the
+// authoritative signal for whether extraction is needed.
 async function extractZipIfNeeded(buffer, filename, mimeType) {
-  const bytes = new Uint8Array(buffer);
-  if (bytes[0] !== 0x50 || bytes[1] !== 0x4B || bytes[2] !== 0x03 || bytes[3] !== 0x04) {
+  if (mimeType !== 'application/zip') {
     return { buffer, filename, mimeType };
   }
   const view    = new DataView(buffer);
+  const bytes   = new Uint8Array(buffer);
   const method  = view.getUint16(8,  true);
   const fnLen   = view.getUint16(26, true);
   const efLen   = view.getUint16(28, true);
