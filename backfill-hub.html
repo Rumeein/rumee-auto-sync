@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Rumee — Backfill Hub</title>
+  <style>
+    body { font-family: monospace; padding: 24px; background: #1a1a1a; color: #e0e0e0; margin: 0; max-width: 820px; }
+    h2  { color: #90caf9; margin: 0 0 4px; }
+    p.sub { color: #aaa; margin: 0 0 24px; font-size: 13px; }
+    .card {
+      background: #222; border: 1px solid #333; border-radius: 8px;
+      padding: 16px 20px; margin-bottom: 14px; display: flex;
+      justify-content: space-between; align-items: center; gap: 16px;
+    }
+    .card h3 { margin: 0 0 6px; color: #e0e0e0; font-size: 15px; }
+    .card p  { margin: 0; color: #999; font-size: 12px; line-height: 1.5; }
+    .card a.open {
+      flex-shrink: 0; padding: 8px 18px; background: #2196f3; color: white;
+      text-decoration: none; border-radius: 4px; font-size: 13px; font-family: monospace;
+    }
+    .card a.open:hover { background: #1976d2; }
+    .note { color: #666; font-size: 12px; margin-top: 20px; border-top: 1px solid #333; padding-top: 14px; }
+  </style>
+</head>
+<body>
+  <h2>Backfill Hub</h2>
+  <p class="sub">Pick a tool below. Each opens in a new tab with its own date-range picker — set the dates and click Run there.</p>
+
+  <div class="card">
+    <div>
+      <h3>Meesho Payments</h3>
+      <p>meesho_payments_YYYY-MM-DD.xlsx via Payments to Date → Custom Date Range.</p>
+    </div>
+    <a class="open" href="me-payments-backfill.html" target="_blank">Open</a>
+  </div>
+
+  <div class="card">
+    <div>
+      <h3>Meesho Orders</h3>
+      <p>meesho_orders_YYYY-MM-DD.csv via Orders → Export → Download.</p>
+    </div>
+    <a class="open" href="me-orders-backfill.html" target="_blank">Open</a>
+  </div>
+
+  <div class="card">
+    <div>
+      <h3>Meesho Payments — Upload Local ZIPs</h3>
+      <p>Already have payment ZIPs saved locally (e.g. from a manual download)? Upload them directly instead of re-fetching from Meesho.</p>
+    </div>
+    <a class="open" href="me-payments-upload.html" target="_blank">Open</a>
+  </div>
+
+  <div class="card">
+    <div>
+      <h3>Flipkart Returns</h3>
+      <p>flipkart_returns_YYYY-MM-DD.csv via All Returns → Date of Closure. FK caps report requests at 20/day across all types.</p>
+    </div>
+    <a class="open" href="test-returns.html" target="_blank">Open</a>
+  </div>
+
+  <div class="note">
+    None of these run automatically — each needs Meesho or Flipkart logged in, and a manual click to start.
+    Don't run daily sync at the same time as any of these.
+  </div>
+</body>
+</html>

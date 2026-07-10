@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>FK Views Lag Test</title>
+  <style>
+    body { font-family: monospace; padding: 24px; background: #1a1a1a; color: #e0e0e0; margin: 0; }
+    h2 { color: #90caf9; margin: 0 0 6px; }
+    p  { color: #aaa; margin: 0 0 16px; font-size: 13px; }
+    button { padding: 8px 20px; margin: 0 6px 0 0; cursor: pointer; border: none; border-radius: 4px; font-size: 14px; font-family: monospace; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    #runBtn  { background: #2196f3; color: white; }
+    #stopBtn { background: #f44336; color: white; }
+    table { border-collapse: collapse; width: 600px; margin-top: 20px; }
+    th, td { border: 1px solid #333; padding: 8px 14px; text-align: left; font-size: 13px; }
+    th { background: #222; color: #90caf9; }
+    tr:hover td { background: #222; }
+    .ready    { color: #4caf50; font-weight: bold; }
+    .notready { color: #ff9800; font-weight: bold; }
+    .error    { color: #f44336; font-weight: bold; }
+    .running  { color: #64b5f6; }
+    .waiting  { color: #555; }
+    #log { margin-top: 16px; background: #111; padding: 10px; height: 140px; overflow-y: auto;
+           font-size: 12px; color: #888; border: 1px solid #333; width: 594px; }
+    #summary { margin-top: 14px; font-size: 13px; color: #ccc; }
+  </style>
+</head>
+<body>
+  <h2>FK Views Lag Test</h2>
+  <p>Finds which dates have views data ready to download. Jun 1–4 already verified manually (all OK).<br>
+     Opens FK seller dashboard via the bulk system — do not run the daily sync while this is running.</p>
+
+  <button id="runBtn">Recheck Jun 6–9</button>
+  <button id="stopBtn" disabled>Stop</button>
+
+  <table>
+    <thead><tr><th>Date</th><th>Status</th><th>Detail</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <div id="summary"></div>
+  <div id="log"></div>
+
+  <script src="test-views-lag.js"></script>
+</body>
+</html>

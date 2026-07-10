@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Meesho Payments — Upload from Local ZIPs</title>
+  <style>
+    body { font-family: monospace; padding: 24px; background: #1a1a1a; color: #e0e0e0; margin: 0; }
+    h2  { color: #90caf9; margin: 0 0 4px; }
+    p   { color: #aaa; margin: 0 0 16px; font-size: 13px; }
+    .drop-zone {
+      border: 2px dashed #444; border-radius: 8px; padding: 20px 24px;
+      margin-bottom: 16px; width: 700px; box-sizing: border-box;
+      color: #aaa; font-size: 13px; cursor: pointer; transition: border-color 0.2s;
+    }
+    .drop-zone.drag-over { border-color: #2196f3; color: #90caf9; }
+    .drop-zone input { display: none; }
+    button { padding: 8px 20px; margin: 0 6px 0 0; cursor: pointer; border: none;
+             border-radius: 4px; font-size: 14px; font-family: monospace; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    #uploadBtn { background: #2196f3; color: white; }
+    #clearBtn  { background: #555; color: #eee; }
+    table { border-collapse: collapse; width: 760px; margin-top: 20px; }
+    th, td { border: 1px solid #333; padding: 8px 12px; text-align: left; font-size: 13px; }
+    th { background: #222; color: #90caf9; }
+    tr:hover td { background: #1e1e1e; }
+    .done    { color: #4caf50; font-weight: bold; }
+    .error   { color: #f44336; font-weight: bold; }
+    .running { color: #64b5f6; }
+    .waiting { color: #555; }
+    .skip    { color: #ff9800; }
+    #log { margin-top: 16px; background: #111; padding: 10px; height: 160px; overflow-y: auto;
+           font-size: 12px; color: #888; border: 1px solid #333; width: 748px; }
+    #summary { margin-top: 14px; font-size: 13px; color: #ccc; min-height: 18px; }
+  </style>
+</head>
+<body>
+  <h2>Meesho Payments — Upload from Local ZIPs</h2>
+  <p>Select the downloaded Meesho payment ZIP files. Each ZIP is extracted to XLSX and uploaded to Drive.<br>
+     Date is read from the filename. Duplicate dates (e.g. Jun 1 × 2) are both uploaded — last one wins.</p>
+
+  <div class="drop-zone" id="dropZone">
+    <input type="file" id="fileInput" multiple accept=".zip">
+    Click to select ZIP files — or drag and drop them here
+  </div>
+
+  <div style="margin-bottom:16px">
+    <button id="uploadBtn" disabled>Upload to Drive</button>
+    <button id="clearBtn">Clear</button>
+    <span id="fileCount" style="color:#888;font-size:13px;margin-left:8px"></span>
+  </div>
+
+  <table id="fileTable" style="display:none">
+    <thead>
+      <tr><th>Filename</th><th>Date</th><th>Status</th><th>Size</th><th>Detail</th></tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <div id="summary"></div>
+  <div id="log"></div>
+
+  <hr style="border-color:#333;margin:24px 0">
+  <h3 style="color:#90caf9;margin:0 0 6px">Duplicate Cleanup — Jun 1</h3>
+  <p style="color:#aaa;font-size:13px;margin:0 0 12px">
+    Two copies of <code>meesho_payments_2026-06-01.xlsx</code> exist in Drive (same size, 19372 bytes).<br>
+    Click below to delete the older one and keep only one.
+  </p>
+  <button id="dedupBtn">Delete Duplicate (Jun 1)</button>
+  <span id="dedupStatus" style="margin-left:12px;font-size:13px;color:#aaa"></span>
+
+  <script src="ist-time.js"></script>
+  <script src="me-payments-upload.js"></script>
+</body>
+</html>

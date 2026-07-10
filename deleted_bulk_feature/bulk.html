@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rumee — Bulk Download</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+      background: #f5f5f5;
+      color: #222;
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    h1 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 20px;
+      color: #1a1a1a;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 10px;
+      padding: 20px 24px;
+      margin-bottom: 18px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    }
+
+    .card h2 {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #666;
+      margin-bottom: 14px;
+    }
+
+    /* ── Date range ─────────────────────────────────────────────── */
+    .date-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .date-row label { font-size: 13px; color: #555; white-space: nowrap; }
+    .date-row input[type="date"] {
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-size: 14px;
+      color: #222;
+      background: #fff;
+      cursor: pointer;
+    }
+    .date-row input[type="date"]:focus { outline: 2px solid #4285f4; border-color: transparent; }
+    .arrow { color: #888; font-size: 16px; }
+
+    /* ── Job list ───────────────────────────────────────────────── */
+    .select-controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .select-controls button {
+      font-size: 12px;
+      padding: 4px 10px;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      background: #fff;
+      cursor: pointer;
+      color: #444;
+    }
+    .select-controls button:hover { background: #f0f0f0; }
+
+    .platform-header {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: #888;
+      margin: 12px 0 6px;
+      letter-spacing: .06em;
+    }
+
+    .job-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 6px;
+    }
+
+    .job-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      user-select: none;
+      transition: background .12s;
+    }
+    .job-item:hover { background: #f5f5f5; }
+    .job-item input[type="checkbox"] { cursor: pointer; accent-color: #4285f4; }
+    .job-item .job-label { font-size: 13px; flex: 1; }
+    .job-item .job-status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #d0d0d0; flex-shrink: 0;
+    }
+    .job-item .job-status-dot.ok      { background: #34a853; }
+    .job-item .job-status-dot.fail    { background: #ea4335; }
+    .job-item .job-status-dot.running { background: #fbbc04; }
+    .job-item .job-status-dot.pending { background: #4285f4; }
+
+    /* ── Actions ────────────────────────────────────────────────── */
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .btn {
+      padding: 10px 22px;
+      border: none;
+      border-radius: 7px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+    }
+    .btn:active { transform: scale(.97); }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn--primary  { background: #4285f4; color: #fff; }
+    .btn--danger   { background: #ea4335; color: #fff; }
+    .btn--secondary{ background: #e8e8e8; color: #333; }
+
+    /* ── Status banner ──────────────────────────────────────────── */
+    #statusBanner {
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-weight: 500;
+      font-size: 14px;
+      display: none;
+    }
+    #statusBanner.show { display: block; }
+    #statusBanner.idle    { background: #f0f0f0; color: #555; }
+    #statusBanner.running { background: #e8f0fe; color: #1a73e8; }
+    #statusBanner.done    { background: #e6f4ea; color: #1e8e3e; }
+    #statusBanner.error   { background: #fce8e6; color: #c5221f; }
+
+    /* ── Progress table ─────────────────────────────────────────── */
+    #progressSection { display: none; }
+    #progressSection.show { display: block; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th {
+      text-align: left;
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: #888;
+      border-bottom: 1px solid #eee;
+    }
+    tbody td {
+      padding: 6px 10px;
+      border-bottom: 1px solid #f5f5f5;
+      vertical-align: middle;
+    }
+    .status-cell { font-weight: 600; }
+    .status-cell.ok      { color: #1e8e3e; }
+    .status-cell.fail    { color: #c5221f; }
+    .status-cell.running { color: #1a73e8; }
+    .status-cell.queued  { color: #888; }
+
+    .error-cell { color: #c5221f; font-size: 12px; max-width: 300px; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <h1>Bulk Download</h1>
+
+  <!-- Date range -->
+  <div class="card">
+    <h2>Date Range</h2>
+    <div class="date-row">
+      <label for="fromDate">From</label>
+      <input type="date" id="fromDate">
+      <span class="arrow">→</span>
+      <label for="toDate">To</label>
+      <input type="date" id="toDate">
+    </div>
+  </div>
+
+  <!-- Job selection -->
+  <div class="card">
+    <h2>Jobs</h2>
+    <div class="select-controls">
+      <button id="selectAllBtn">Select all</button>
+      <button id="deselectAllBtn">Deselect all</button>
+    </div>
+    <div id="jobList"></div>
+  </div>
+
+  <!-- Actions -->
+  <div class="card">
+    <div class="actions">
+      <button id="runBtn"  class="btn btn--primary">▶ Start Bulk Download</button>
+      <button id="stopBtn" class="btn btn--danger" style="display:none">■ Stop</button>
+    </div>
+  </div>
+
+  <!-- Status banner -->
+  <div id="statusBanner" class="show idle">Idle — choose a date range and jobs, then click Start.</div>
+
+  <!-- Progress -->
+  <div id="progressSection" class="card">
+    <h2>Progress</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Job</th>
+          <th>Status</th>
+          <th>Detail</th>
+        </tr>
+      </thead>
+      <tbody id="progressBody"></tbody>
+    </table>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="bulk.js"></script>
+</body>
+</html>
