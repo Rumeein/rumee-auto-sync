@@ -652,7 +652,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await chrome.alarms.clear('fk_returns_recheck');
       await chrome.alarms.clear('fk_listings_recheck');
       await chrome.alarms.clear('rumee_sync_retry');
-      await chrome.storage.local.set({ syncRunning: false, syncQueue: [] });
+      await chrome.storage.local.set({ syncRunning: false, syncQueue: [], lastSyncEndTime: Date.now() });
       await chrome.storage.local.remove([
         'currentJobId', 'fk_rc_recheck_count', 'fk_views_recheck_count',
         'fk_returns_recheck_count', 'fk_listings_recheck_count', 'fk_listings_gen_date',
@@ -890,7 +890,7 @@ async function handlePanelLoginRequired(msg) {
     `Please open the ${platformName} and log in, then tap "Run Now" again.`);
   await markJobResult(msg.jobId, false, `Login required — open ${domain}`);
   await closeCurrentTab();
-  await chrome.storage.local.set({ syncRunning: false, syncQueue: [] });
+  await chrome.storage.local.set({ syncRunning: false, syncQueue: [], lastSyncEndTime: Date.now() });
 }
 
 // ─── Job result helpers ───────────────────────────────────────────────────────
@@ -966,7 +966,11 @@ async function markJobResult(jobId, success, errMsg = null) {
 }
 
 async function finishSync(done, failed) {
-  await chrome.storage.local.set({ syncRunning: false });
+  // lastSyncEndTime lets the download listener distinguish "a download from
+  // THIS sync arrived late, right after it finished" from "an unrelated
+  // manual download happening at some random later time" -- see the
+  // uncaptured-download guard in chrome.downloads.onCreated below.
+  await chrome.storage.local.set({ syncRunning: false, lastSyncEndTime: Date.now() });
   await chrome.storage.local.remove(['currentJobId', 'currentTabId']);
 
   // "jobs completed", not "files synced" — request-only jobs (fk_orders/returns/
@@ -1029,7 +1033,7 @@ async function isRunning() {
   const { syncStarted } = await chrome.storage.local.get('syncStarted');
   if (syncRunning && syncStarted && Date.now() - syncStarted > 90 * 60_000) {
     console.warn('[Rumee] Stale sync detected — resetting');
-    await chrome.storage.local.set({ syncRunning: false });
+    await chrome.storage.local.set({ syncRunning: false, lastSyncEndTime: Date.now() });
     return false;
   }
   return !!syncRunning;
@@ -1493,14 +1497,37 @@ chrome.downloads.onCreated.addListener((item) => {
   }
 
   // ── SLOW FALLBACK PATH ────────────────────────────────────────────────────
-  chrome.storage.local.get(['syncRunning', 'currentJobId', '_pendingFilenameOverride'], ({ syncRunning, currentJobId, _pendingFilenameOverride }) => {
+  chrome.storage.local.get(['syncRunning', 'currentJobId', '_pendingFilenameOverride', 'lastSyncEndTime'], ({ syncRunning, currentJobId, _pendingFilenameOverride, lastSyncEndTime }) => {
     if (!syncRunning || !currentJobId) {
-      // Nothing armed at all — this download will show Chrome's native Save-As
-      // dialog uncontrolled. Record it (even though we can't intercept it) so
-      // a future session can tell whether this is a real recurring gap or a
-      // one-off — see rumee-auto-sync memory context.md for the investigation.
-      if (CDN_DOMAINS.test(item.url) || /meesho|flipkart/i.test(item.url)) {
-        console.warn(`[Rumee] UNCAPTURED download (nothing armed): ${item.url.slice(0, 160)}`);
+      // Nothing armed — the sync this download belonged to has already finished
+      // or timed out by the time Chrome actually created the download (confirmed
+      // real incident 2026-07-10: a me_payments ZIP arrived late enough that the
+      // whole sync had already moved on). Previously this left Chrome's native
+      // Save-As dialog sitting open indefinitely, requiring a manual click.
+      //
+      // Fix: for any Meesho/Flipkart-looking download that arrives within a
+      // short window (5 min) after a sync ended, cancel it anyway to kill the
+      // blocking dialog. The 5-min window matters — outside a sync, downloads
+      // must stay untouched (see the guard comment above this listener); a
+      // Meesho/Flipkart URL hours or days later during idle time could easily
+      // be Jaiswal manually downloading something himself, and cancelling that
+      // would be a real regression, not a fix. We deliberately do NOT try to
+      // guess which job this straggler belonged to and re-upload it (a wrong
+      // guess = file lands in the wrong Drive folder, worse than not capturing
+      // it at all) — whichever job this was will either already be covered by
+      // gap-catchup's automatic retry, or show up in the log as a genuine
+      // failure to recover manually.
+      const withinRecentSyncWindow = lastSyncEndTime && (Date.now() - lastSyncEndTime) < 5 * 60_000;
+      if (withinRecentSyncWindow && (CDN_DOMAINS.test(item.url) || /meesho|flipkart/i.test(item.url))) {
+        console.warn(`[Rumee] UNCAPTURED download (nothing armed, ${Math.round((Date.now()-lastSyncEndTime)/1000)}s after last sync ended) — cancelling to prevent Save-As dialog: ${item.url.slice(0, 160)}`);
+        chrome.downloads.cancel(item.id, () => { chrome.downloads.erase({ id: item.id }, () => {}); });
+        chrome.storage.local.get({ uncapturedDownloads: [] }, ({ uncapturedDownloads }) => {
+          uncapturedDownloads.push({ ts: new Date().toISOString(), url: item.url.slice(0, 300), filename: item.filename || '' });
+          chrome.storage.local.set({ uncapturedDownloads: uncapturedDownloads.slice(-20) });
+        });
+      } else if (CDN_DOMAINS.test(item.url) || /meesho|flipkart/i.test(item.url)) {
+        // Outside the recent-sync window — leave it untouched, same as before.
+        console.warn(`[Rumee] UNCAPTURED download (nothing armed, outside recent-sync window): ${item.url.slice(0, 160)}`);
         chrome.storage.local.get({ uncapturedDownloads: [] }, ({ uncapturedDownloads }) => {
           uncapturedDownloads.push({ ts: new Date().toISOString(), url: item.url.slice(0, 300), filename: item.filename || '' });
           chrome.storage.local.set({ uncapturedDownloads: uncapturedDownloads.slice(-20) });

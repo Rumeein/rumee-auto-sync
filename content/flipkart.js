@@ -2339,6 +2339,98 @@ async function handleFkViewsRequest(job) {
   chrome.runtime.sendMessage({ type: 'JOB_DONE', jobId: job.id });
 }
 
+// â”€â”€ FK Views content verification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Root cause (found 2026-07-10, real incident: flipkart_views_2026-07-03.xlsx):
+// a multi-day range request (e.g. 07-02â†’07-03) can come back from FK with only
+// PART of the range actually populated â€” no error, no warning, just fewer days
+// of data than asked for. The old code trusted the requested "to" date blindly
+// and advanced the watermark past it, permanently losing the missing day with
+// no way to notice. Fix: after downloading, read the ACTUAL latest date present
+// inside the file and only advance the watermark that far â€” never past what was
+// actually captured. If verification itself fails for any reason, fall back to
+// the old trusting behavior (fail safe â€” a verification bug must never be worse
+// than not verifying at all).
+
+// Finds the End of Central Directory record (same technique already used in
+// background.js's extractZipIfNeeded, just reused here for a different job).
+function _zipFindEOCD(bytes) {
+  for (let i = bytes.length - 22; i >= 0; i--) {
+    if (bytes[i] === 0x50 && bytes[i+1] === 0x4B && bytes[i+2] === 0x05 && bytes[i+3] === 0x06) return i;
+  }
+  return -1;
+}
+
+// Reads a NAMED entry out of a general (multi-entry) ZIP archive, unlike
+// background.js's extractZipIfNeeded which only handles a single-entry ZIP.
+// Returns the decompressed bytes, or null on any failure â€” never throws, so
+// callers can safely treat null as "couldn't verify" and fall back.
+async function _extractNamedZipEntry(buffer, entryName) {
+  try {
+    const bytes = new Uint8Array(buffer);
+    const view  = new DataView(buffer);
+    const eocdOff = _zipFindEOCD(bytes);
+    if (eocdOff < 0) return null;
+
+    const entryCount = view.getUint16(eocdOff + 10, true);
+    let cdOff = view.getUint32(eocdOff + 16, true);
+
+    for (let i = 0; i < entryCount; i++) {
+      if (bytes[cdOff] !== 0x50 || bytes[cdOff+1] !== 0x4B || bytes[cdOff+2] !== 0x01 || bytes[cdOff+3] !== 0x02) break;
+      const compMethod = view.getUint16(cdOff + 10, true);
+      const compSize   = view.getUint32(cdOff + 20, true);
+      const fnLen      = view.getUint16(cdOff + 28, true);
+      const extraLen   = view.getUint16(cdOff + 30, true);
+      const commentLen = view.getUint16(cdOff + 32, true);
+      const localOff   = view.getUint32(cdOff + 42, true);
+      const name       = new TextDecoder().decode(bytes.slice(cdOff + 46, cdOff + 46 + fnLen));
+
+      if (name === entryName) {
+        const lfnLen  = view.getUint16(localOff + 26, true);
+        const lefLen  = view.getUint16(localOff + 28, true);
+        const dataOff = localOff + 30 + lfnLen + lefLen;
+        const compressed = bytes.slice(dataOff, dataOff + compSize);
+
+        if (compMethod === 0) return compressed;
+        if (compMethod === 8) {
+          const ds = new DecompressionStream('deflate-raw');
+          const writer = ds.writable.getWriter();
+          const reader = ds.readable.getReader();
+          writer.write(compressed);
+          writer.close();
+          const chunks = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+          }
+          const total = chunks.reduce((s, c) => s + c.length, 0);
+          const out = new Uint8Array(total);
+          let off = 0;
+          for (const c of chunks) { out.set(c, off); off += c.length; }
+          return out;
+        }
+        return null; // unsupported compression method
+      }
+      cdOff += 46 + fnLen + extraLen + commentLen;
+    }
+    return null; // entry not found
+  } catch (e) {
+    return null; // fail safe
+  }
+}
+
+// Returns the latest "Impression Date" actually present in a downloaded FK
+// Views XLSX buffer, or null if it couldn't be determined (parsing failed,
+// or no dates found â€” either way, callers fall back to trusting the request).
+async function _fkViewsActualMaxDate(buffer) {
+  const sheetBytes = await _extractNamedZipEntry(buffer, 'xl/worksheets/sheet1.xml');
+  if (!sheetBytes) return null;
+  const xml = new TextDecoder('utf-8').decode(sheetBytes);
+  const dates = xml.match(/\d{4}-\d{2}-\d{2}/g);
+  if (!dates || !dates.length) return null;
+  return dates.reduce((max, d) => (d > max ? d : max));
+}
+
 // â”€â”€ Phase 2: fk_views â€” download when ready, else hourly recheck (max 3) â”€â”€â”€â”€â”€â”€
 async function handleFkViewsDownload(job) {
   const vlog = txt => chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id, text: `Views2: ${txt}` });
@@ -2377,8 +2469,24 @@ async function handleFkViewsDownload(job) {
     let binary = ''; const CHUNK = 8192;
     for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
     vlog(`downloaded ${bytes.length} bytes â€” uploading as ${datedFilename}`);
+
+    // Verify the file actually contains data up to "to" before trusting it â€”
+    // FK can silently return a partial range (confirmed real incident:
+    // 2026-07-03's file only contained 07-02's data). Only advance the
+    // watermark as far as what was ACTUALLY captured, so a short-changed
+    // range gets its missing tail retried on a future run instead of being
+    // silently marked done.
+    const actualMaxDate = await _fkViewsActualMaxDate(buffer);
+    let watermarkTo = to;
+    if (actualMaxDate && actualMaxDate < to) {
+      vlog(`WARNING: requested up to ${to} but file only contains data through ${actualMaxDate} â€” watermark advancing to ${actualMaxDate} only, ${to} will be retried on a future run`);
+      watermarkTo = actualMaxDate;
+    } else if (!actualMaxDate) {
+      vlog(`could not verify actual date coverage (parse failed) â€” trusting requested date ${to}`);
+    }
+
     // Remember coverage + clear recheck counter for the next cycle.
-    await new Promise(res => chrome.storage.local.set({ fk_views_last_to: to }, res));
+    await new Promise(res => chrome.storage.local.set({ fk_views_last_to: watermarkTo }, res));
     await new Promise(res => chrome.storage.local.remove(['fk_views_recheck_count'], res));
     chrome.runtime.sendMessage({
       type: 'UPLOAD_DATA', jobId: job.id, data: btoa(binary), encoding: 'base64',
