@@ -1465,6 +1465,44 @@ because the extension's clicks are synthetic, not trusted user gestures — fixe
 adding `seller.flipkart.com` to Chrome's popup-allow list (see Section 14
 Prerequisites). Confirmed fixed via live test on FK_VIEWS and FK_LISTINGS.
 
+### Resolved: FK Views silently accepting a partial multi-day range (2026-07-10)
+
+A multi-day FK Views range request (e.g. 07-02 → 07-03) could come back from Flipkart
+with data for only PART of the range — no error, no warning. Confirmed real incident:
+`flipkart_views_2026-07-03.xlsx`, from an automated 2-day catch-up request, contained
+data for 07-02 only; 07-03's real data was never actually captured, but the code
+advanced its `fk_views_last_to` watermark past 07-03 anyway, permanently believing
+that date was done. Checked 2 other historical multi-day catches (06-14→06-16,
+06-21→06-22) and both worked correctly — this looks like a rare FK-side glitch, not
+a systemic issue, but the code had zero defense against it happening again.
+**Fix:** after download, the extension now unzips just `xl/worksheets/sheet1.xml`
+from the downloaded XLSX (dates are stored as plain inline-string text there — no
+complex encoding needed) and reads the actual latest "Impression Date" present. The
+watermark only advances that far, never past what was verifiably captured — a
+short-changed range now correctly leaves its missing tail to be retried on a future
+run instead of being silently marked done. Fails safe: any parsing error falls back
+to the old trust-the-request behavior. See `_extractNamedZipEntry` /
+`_fkViewsActualMaxDate` in `content/flipkart.js`. Tested against the real broken
+file plus 3 other real files (not synthetic data) before shipping.
+
+### Resolved: orphaned late-arriving download left Chrome's Save-As dialog open (2026-07-10)
+
+Confirmed real incident: a `me_payments` download arrived so late that the whole
+sync had already finished by the time Chrome created the download event — nothing
+was left "armed" to intercept and cancel it, so Chrome's native Save-As dialog sat
+open indefinitely, requiring a manual click to dismiss. This was not a RELAY_ARM
+regression (RELAY_ARM only ever applied to Flipkart, never Meesho — verified by a
+full codebase search before making any change).
+**Fix:** `background.js` now tracks `lastSyncEndTime` (set everywhere `syncRunning`
+transitions to false). The "nothing armed" download handler cancels a Meesho/
+Flipkart-looking download if it arrives within 5 minutes of the last sync ending —
+narrow enough that a genuine manual download made hours or days later is never
+touched, preserving the original guarantee that downloads outside an active sync
+stay untouched. Does not attempt to guess which job the straggler belonged to and
+re-upload it (a wrong guess would land the file in the wrong Drive folder) — that
+job either gets auto-retried by the gap self-healing system (Section 24) if it's
+one of the covered jobs, or shows up as a normal failure in the log.
+
 ---
 
 ## 19. How to Add a New Report
