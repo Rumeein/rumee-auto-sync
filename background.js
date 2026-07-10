@@ -1770,21 +1770,50 @@ const MANIFEST_SLOTS = [
 async function verifyAndLogManifest() {
   const token = await getDriveToken(true);
 
-  // Run window: from the moment the sync started. Any file uploaded after that
-  // point belongs to this run. Falls back to start-of-today.
-  const { syncStarted } = await chrome.storage.local.get('syncStarted');
-  let cutoffMs;
-  if (syncStarted) {
-    cutoffMs = syncStarted;
-  } else {
-    const sod = new Date(); sod.setHours(0, 0, 0, 0); cutoffMs = sod.getTime();
-  }
-  const cutoffIso = new Date(cutoffMs).toISOString();
-
   const runDate  = todayStr();
   const dataDate = yesterdayISOBg();
 
-  // List files in a folder modified at/after the cutoff.
+  // Single/multi-kind slots (20 of 22) always upload with the exact data date
+  // embedded in the filename (e.g. flipkart_orders_2026-07-10.xlsx) — verified
+  // by checking every folder directly. So for those, match on that filename
+  // instead of upload recency: it checks WHAT was captured, not WHEN this
+  // function happened to run relative to it. This also fixes the original bug
+  // (below) at the root instead of narrowing the timing window.
+  const filesForDate = async (folderId) => {
+    const nameQ = encodeURIComponent(
+      `'${folderId}' in parents and trashed=false and name contains '${dataDate}'`
+    );
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${nameQ}&fields=files(name,modifiedTime)&pageSize=100`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (res.status === 401) { await invalidateDriveToken(); throw new Error('Drive token expired'); }
+    if (!res.ok) throw new Error(`manifest list failed (${res.status}) for folder ${folderId}`);
+    return (await res.json()).files || [];
+  };
+
+  // The 2 append-kind slots (meesho_views.csv, meesho_ads_master.csv) are a
+  // single rolling file with no date in the name — content is appended/upserted
+  // in place, so they can only be checked by modifiedTime. Window is anchored to
+  // the START of dataDate's own IST day, a full day before the earliest a sync
+  // for this dataDate could plausibly run, so it stays correct regardless of
+  // exactly when this function is called relative to that sync.
+  //
+  // ORIGINAL BUG (fixed here): this used to anchor to `syncStarted` from
+  // chrome.storage.local. This function scans ALL 22 slots every time it runs,
+  // and it's called again after every recheck mini-sync (fk_rc_recheck,
+  // fk_views_recheck, fk_returns_recheck, fk_listings_recheck) — each of which
+  // overwrites `syncStarted` to its OWN recent start time. A recheck firing
+  // hours after the main sync would then find every OTHER job's already-uploaded
+  // file "stale" against that narrow new cutoff and wrongly flip its correct
+  // Verified row back to Missing. Confirmed via rumee_sync_log.csv: e.g.
+  // 2026-06-17 "21 verified, 2 missing" immediately followed 6 min later by a
+  // recheck logging "0 verified, 23 missing" for the same data date — and
+  // reproduced live in this session testing an istToday()-anchored fix, which
+  // broke the same way when called after IST midnight relative to the sync.
+  const cutoffMs = Date.parse(`${dataDate}T00:00:00Z`) - IST_OFFSET_MS;
+  const cutoffIso = new Date(cutoffMs).toISOString();
+
   const freshFiles = async (folderId) => {
     const q = encodeURIComponent(
       `'${folderId}' in parents and trashed=false and modifiedTime > '${cutoffIso}'`
@@ -1810,7 +1839,7 @@ async function verifyAndLogManifest() {
     const folderId = DRIVE_FOLDERS[slot.folderKey];
     if (!folderId) continue;
     let fresh = [];
-    try { fresh = await freshFiles(folderId); }
+    try { fresh = slot.kind === 'append' ? await freshFiles(folderId) : await filesForDate(folderId); }
     catch (e) { logError('verify', `${slot.label}: list error ${e.message}`); }
 
     if (slot.kind === 'multi') {
