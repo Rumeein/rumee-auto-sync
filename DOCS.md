@@ -1151,6 +1151,61 @@ Different reports use different download methods. The content script uses the ap
 
 ---
 
+### Method 7: RELAY_ARM — chrome.downloads.onCreated interception
+
+Used by: FK_VIEWS, FK_ORDERS, FK_PAYMENTS, FK_RC_DOWNLOAD, FK_RETURNS (download phase),
+FK_CLAIMS, FK_LISTINGS (download phase). Replaces the older fetch/XHR-monkeypatch
+capture (`interceptNextDownload`, removed 2026-07-09) for these jobs.
+
+**Why it exists:** several FK "Download" buttons trigger the file via `window.open()`
+(a real browser navigation) rather than a page-level `fetch()`/`XHR` call — the FK
+Views "Download Listings Report" button is a confirmed example. A content script's
+`fetch`/`XHR` monkey-patch (`content/intercept.js`, world: MAIN) can only ever see
+`fetch`/`XHR` calls; it structurally cannot observe a `window.open()` navigation, so
+the old capture mechanism just times out for these buttons — no error, no dialog,
+nothing to intercept. `chrome.downloads.onCreated` in `background.js`, by contrast,
+fires with the real download URL for *any* download Chrome's download manager
+registers, regardless of how it was triggered.
+
+```
+Content script (before clicking the Download button):
+  1. chrome.runtime.sendMessage({ type: 'RELAY_ARM', jobId })
+     → background.js sets _relayArmedJobId = jobId (in-memory, synchronous)
+  2. Click the Download button (el.click() — synthetic, not a trusted gesture)
+  3. pollStorageForRelay(TIMEOUT_MS) — polls chrome.storage.local for '_relayedDownload'
+
+Background.js (chrome.downloads.onCreated listener, RELAY PATH — checked first):
+  1. Fires the instant Chrome registers ANY download, with item.url already known
+  2. If _relayArmedJobId is set: cancel the download synchronously (no Save-As
+     dialog is ever shown — cancellation happens before Chrome reaches that point)
+  3. chrome.storage.local.set({ _relayedDownload: { url: item.url, ts } })
+  4. Clear _relayArmedJobId
+
+Content script (resumed):
+  4. Picks up the relayed URL, removes it from storage
+  5. Does its OWN fetch(url, { credentials: 'include' }) — NOT background's fetch,
+     because background's fetch fails CORS on some FK CDN endpoints (confirmed for
+     FK_CLAIMS) — only the capture/cancel step moved to background, not the fetch
+  6. Existing job-specific bookkeeping (fk_views_last_to, filename, etc.) unchanged
+```
+
+**Prerequisite:** popups must be allowed for `seller.flipkart.com` (see Section 14).
+Without it, `window.open()` never fires at all — Chrome's popup blocker silently
+kills it before it becomes a download, so there's nothing for `onCreated` to catch
+either. RELAY_ARM fixes the *interception* problem; the popup permission fixes the
+*the download never starting* problem. Both were required — confirmed by testing
+one without the other and getting a clean timeout with zero dialog and zero new tab.
+
+**Confirmed working (2026-07-09), 5 of 6 jobs with direct live evidence:** FK_VIEWS,
+FK_LISTINGS/FK_LISTINGS_DOWNLOAD, FK_PAYMENTS (via `_downloadFkReport`), FK_CLAIMS,
+FK_RETURNS_DOWNLOAD — all clean, no dialog, no timeout, correct file verified in
+Drive within seconds of the click. Only FK_ORDERS untested directly (its Reports
+Centre report was still generating on FK's side during testing) — it shares the
+byte-identical `_downloadFkReport` function FK_PAYMENTS just passed cleanly, so
+high confidence but not directly observed.
+
+---
+
 ## 12. Bot Detection & Human-like Behavior
 
 ### Meesho — Akamai Bot Manager
@@ -1210,6 +1265,15 @@ Similar approach. If Flipkart session expires mid-job, attempt autofill login on
 - Must be logged into seller.flipkart.com in Chrome
 - Chrome must have saved passwords for both portals (for session recovery)
 - A Google account (the extension will create Drive folders automatically)
+- **Pop-ups allowed for `seller.flipkart.com`** — `chrome://settings/content/popups` →
+  "Allowed to send pop-ups and use redirects" → Add `https://seller.flipkart.com`.
+  Several FK download buttons (Traffic Report, Reports Centre, Claims, Listings) open
+  the file via `window.open()`, which Chrome's popup blocker silently kills unless the
+  click is a real trusted user gesture — the extension's clicks are synthetic, so
+  without this exception those downloads never start at all (silent timeout, no error
+  visible on screen). `supplier.meesho.com` needs the same exception and is already
+  in the list on the reference machine — always add both when setting up on a new
+  machine/profile. See Section 18 for the incident this was discovered from.
 
 ### Step 1: Load the Extension in Chrome
 
@@ -1385,6 +1449,20 @@ The extension uploads files using the `filename` from each job's config.js defin
 | 🟢 Low | FK_ORDERS scheduled report date range | Unknown whether auto-generated report covers yesterday only or rolling window | Check when first scheduled report appears on 31 May 2026 |
 | 🟢 Low | FK_VIEWS file format | Config says CSV but not confirmed | Verify file extension when first download completes |
 | 🟢 Info | Meesho 1-month max range | Orders portal enforces 1-month max date range | Content script must split large gaps into multiple ≤30-day requests |
+
+### Resolved: FK download Save-As dialog / silent timeout (2026-07-09)
+
+Several FK jobs (FK_VIEWS, FK_ORDERS, FK_PAYMENTS, FK_RC_DOWNLOAD, FK_RETURNS download
+phase, FK_CLAIMS, FK_LISTINGS) would intermittently either show a native Save-As
+dialog mid-sync, or silently time out with no dialog at all, leaving that day's file
+missing from Drive with no visible error. Root cause was two independent, compounding
+issues, both required for a fix: (1) the download-URL capture mechanism couldn't see
+`window.open()`-triggered downloads at all — fixed by moving capture to
+`chrome.downloads.onCreated` in background.js (see Section 11, Method 7 — RELAY_ARM);
+(2) `window.open()` itself was being silently blocked by Chrome's popup blocker
+because the extension's clicks are synthetic, not trusted user gestures — fixed by
+adding `seller.flipkart.com` to Chrome's popup-allow list (see Section 14
+Prerequisites). Confirmed fixed via live test on FK_VIEWS and FK_LISTINGS.
 
 ---
 

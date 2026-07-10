@@ -22,7 +22,7 @@ let tokenExpires = 0;   // epoch ms
 
 function log(msg) {
   const el = document.getElementById('log');
-  el.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+  el.textContent += `[${istTimeOnly(Date.now())}] ${msg}\n`;
   el.scrollTop = el.scrollHeight;
 }
 
@@ -50,9 +50,14 @@ async function getToken() {
     // Store credentials so onAuthRequired listener can supply them if server challenges us
     await chrome.storage.local.set({ fkApiKey: apiKey, fkApiSecret: apiSecret });
 
-    const resp = await fetch(`${TOKEN_URL}?${qs.toString()}`, {
-      method:  'GET',
-      headers: { 'Authorization': 'Basic ' + credentials },
+    // FK OAuth token endpoint requires POST with body (not GET with query string)
+    const resp = await fetch(TOKEN_URL, {
+      method:  'POST',
+      headers: {
+        'Authorization': 'Basic ' + credentials,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: qs.toString(),
     });
 
     const raw = await resp.text();

@@ -190,6 +190,7 @@
   </div>
 </div>
 
+<script src="ist-time.js"></script>
 <script src="config.js"></script>
 <script src="logger.js"></script>
 <script>
@@ -259,10 +260,7 @@
 
   function formatTs(isoStr) {
     try {
-      const d = new Date(isoStr);
-      const date = d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-      const time = d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-      return `${date} ${time}`;
+      return istDisplayString(isoStr);
     } catch { return isoStr; }
   }
 
@@ -284,7 +282,7 @@
     const blob = new Blob([csv], { type: 'text/csv' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `rumee_log_${new Date().toISOString().slice(0,10)}.csv`;
+    a.download = `rumee_log_${istToday()}.csv`;
     a.click();
   }
 

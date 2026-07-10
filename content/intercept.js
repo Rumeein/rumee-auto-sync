@@ -233,6 +233,16 @@ window.fetch = function(input, init) {
       }));
     }
   }
+  // ── Expose submitReport response status via window event ─────────────────────
+  // Injected scripts (isolated world) listen for __rumeeSubmitReport to detect
+  // whether "Request Download" was a new submission (2xx) or duplicate (4xx/5xx).
+  if (url.includes('/submitReport')) {
+    return _origFetch.apply(this, arguments).then(resp => {
+      window.postMessage({ __rumeeSubmitReport: true, status: resp.status }, '*');
+      return resp;
+    });
+  }
+
   return _origFetch.apply(this, arguments);
 };
 
