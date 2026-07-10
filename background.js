@@ -2,7 +2,7 @@
 // MV3 service worker: sleeps between alarms. ALL state lives in
 // chrome.storage.local so we survive sleep/wake cycles mid-job.
 
-importScripts('secrets.js', 'config.js', 'logger.js', 'drive/upload.js', 'bulk/bulk-handler.js');
+importScripts('ist-time.js', 'gap-catchup.js', 'secrets.js', 'config.js', 'logger.js', 'drive/upload.js');
 
 const ALARM_NAME     = 'rumee-daily-sync';
 const KEEPALIVE_ALARM = 'rumee_keepalive';   // wakes SW every 2 min → watchdog can fire on time
@@ -13,20 +13,22 @@ const KEEPALIVE_ALARM = 'rumee_keepalive';   // wakes SW every 2 min → watchdo
 const _YESTERDAY_OVERRIDE_BG = null;
 function yesterdayISOBg() {
   if (_YESTERDAY_OVERRIDE_BG != null) return _YESTERDAY_OVERRIDE_BG;
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0, 10);
+  return istYesterday();
 }
 
 /**
  * Returns the effective startUrl for a job.
  * For FK Ads jobs: navigates directly to Other Reports with ?duration= in the hash,
  * so React mounts fresh at that route and reads the date from the URL on initial mount.
+ * The date is normally "yesterday"; if gap-catchup is enabled for this job and a
+ * previous day's download failed, it targets that missed date instead (see
+ * gcFkAdsTargetDate) — content/flipkart.js reads the SAME date back out of this
+ * URL rather than recomputing it, so every part of the job agrees on one date.
  * For all other jobs: returns job.startUrl unchanged.
  */
-function getEffectiveStartUrl(job) {
+async function getEffectiveStartUrl(job) {
   if (job.platform === 'flipkart' && job.adsReportType) {
-    const date = yesterdayISOBg();
+    const date = await gcFkAdsTargetDate(job.id);
     return `https://seller.flipkart.com/index.html#dashboard/ads/reports/others?duration=${date}_${date}`;
   }
   return job.startUrl;
@@ -53,7 +55,8 @@ chrome.runtime.onInstalled.addListener(async () => {
   await chrome.alarms.clear('fk_views_recheck');
   await chrome.alarms.clear('fk_returns_recheck');
   await chrome.alarms.clear('fk_listings_recheck');
-  await chrome.storage.local.remove(['fk_rc_recheck_count', 'fk_views_recheck_count', 'fk_returns_recheck_count', 'fk_listings_recheck_count', 'fk_listings_gen_date']);
+  await chrome.alarms.clear('rumee_sync_retry');
+  await chrome.storage.local.remove(['fk_rc_recheck_count', 'fk_views_recheck_count', 'fk_returns_recheck_count', 'fk_listings_recheck_count', 'fk_listings_gen_date', '_pendingRetryJobIds']);
 
   // Reinject isolated-world content scripts into any already-open tabs.
   // After extension reload, existing tabs' content scripts are invalidated — relay
@@ -139,11 +142,19 @@ async function scheduleAlarm() {
  * Builds a job queue, stores it, then starts processing.
  */
 async function startSync(manualJobIds = null) {
-  const { bulkRunning } = await chrome.storage.local.get('bulkRunning');
-  if (bulkRunning) { console.log('[Rumee] Bulk sync running — daily sync skipped'); return; }
   const running = await isRunning();
   if (running) {
     console.log('[Rumee] Sync already in progress — skipping');
+    // A targeted request (e.g. a recheck alarm like fk_views_recheck) can
+    // collide with another sync/recheck that's already running (confirmed:
+    // fk_views_recheck and fk_rc_recheck fired ~24s apart on 2026-07-03,
+    // silently dropping the fk_views retry with no record of it happening).
+    // Reschedule a short retry instead of losing it outright.
+    if (manualJobIds && manualJobIds.length) {
+      await chrome.storage.local.set({ _pendingRetryJobIds: manualJobIds });
+      chrome.alarms.create('rumee_sync_retry', { delayInMinutes: 3 });
+      console.log(`[Rumee] Collision — rescheduled retry for [${manualJobIds.join(',')}] in 3 min`);
+    }
     return;
   }
 
@@ -301,7 +312,7 @@ async function openTabForJob(job) {
         }
       }, 1500);
     } else {
-      const effectiveUrl = getEffectiveStartUrl(job);
+      const effectiveUrl = await getEffectiveStartUrl(job);
       console.log(`[Rumee] Reusing existing tab ${best.id} (${best.url.slice(0, 80)}) for ${job.label} → ${effectiveUrl.slice(0, 100)}`);
       // chrome.tabs.update only triggers a full page reload when the base URL (origin +
       // pathname) changes. When only the hash differs (e.g. same SPA, different route),
@@ -323,7 +334,7 @@ async function openTabForJob(job) {
     }
   } else {
     // No panel open — open a new background tab
-    const effectiveUrl = getEffectiveStartUrl(job);
+    const effectiveUrl = await getEffectiveStartUrl(job);
     console.log(`[Rumee] No ${domain} tab found — opening new background tab for ${job.label} → ${effectiveUrl.slice(0, 100)}`);
     tab     = await chrome.tabs.create({ url: effectiveUrl, active: false });
     borrowed = false;
@@ -386,6 +397,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'NOTIFY_USER') {
     notify(msg.title || 'Rumee', msg.message || '');
     sendResponse({ ok: true });
+    return true;
+  }
+
+  // Gap catch-up gave up on a stuck date after GAP_CATCHUP_MAX_DAYS — record it
+  // for the popup's "Mark Done" list and notify on Discord so it's seen even
+  // if nobody's watching this machine right now.
+  if (msg.type === 'GAP_CATCHUP_ESCALATED') {
+    handleGapCatchupEscalated(msg.jobId, msg.date, msg.daysPending, msg.reason).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  // Popup "Mark Done" click — clears one manually-resolved item from the list.
+  if (msg.type === 'MARK_GAP_CATCHUP_DONE') {
+    (async () => {
+      const { gapCatchupManual = [] } = await chrome.storage.local.get('gapCatchupManual');
+      const next = gapCatchupManual.filter(x => !(x.jobId === msg.jobId && x.date === msg.date));
+      await chrome.storage.local.set({ gapCatchupManual: next });
+      logSuccess(msg.jobId, `✓ GapCatchup: ${msg.date} marked done manually`);
+      sendResponse({ ok: true });
+    })();
     return true;
   }
 
@@ -515,6 +546,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Content scripts that must fetch the file themselves (CORS/cookie reasons)
+  // arm this instead of DOWNLOAD_BUTTON_CLICKED. chrome.downloads.onCreated
+  // fires with item.url regardless of HOW the download was triggered — fetch,
+  // XHR, anchor click, or window.open/native navigation (which intercept.js's
+  // fetch/XHR monkey-patch cannot see at all). This cancels the native download
+  // synchronously (suppressing any Save-As dialog) and relays the real URL back
+  // via storage instead of fetching it in the background (which fails CORS for
+  // some FK CDN endpoints) — the content script keeps its existing fetch +
+  // job-specific bookkeeping, just fed a reliable URL.
+  if (msg.type === 'RELAY_ARM') {
+    _relayArmedJobId = msg.jobId;
+    chrome.storage.local.remove('_relayedDownload', () => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.type === 'RELAY_DISARM') {
+    _relayArmedJobId = null;
+    sendResponse({ ok: true });
+    return true;
+  }
+
   // Backfill pages arm the download interceptor before clicking the download button.
   if (msg.type === 'BACKFILL_ARM') {
     _backfillDownload = { filename: msg.filename, folderKey: msg.folderKey, mimeType: msg.mimeType };
@@ -581,6 +632,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Set one or more storage keys directly (e.g. gap-catchup kill-switch flags
+  // during staged rollout) — debug relay counterpart to CLEAR_STORAGE_KEY above.
+  if (msg.type === 'SET_STORAGE_KEYS') {
+    chrome.storage.local.set(msg.values || {}, () => {
+      console.log(`[Rumee] Set storage keys: ${Object.keys(msg.values || {}).join(', ')}`);
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
   // Popup: KILL ALL — abort the current sync AND cancel every pending recheck
   // alarm/counter so no more self-triggered navigations happen. The in-flight
   // tab (if any) finishes its current job; nothing new is started.
@@ -590,10 +651,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await chrome.alarms.clear('fk_views_recheck');
       await chrome.alarms.clear('fk_returns_recheck');
       await chrome.alarms.clear('fk_listings_recheck');
+      await chrome.alarms.clear('rumee_sync_retry');
       await chrome.storage.local.set({ syncRunning: false, syncQueue: [] });
       await chrome.storage.local.remove([
         'currentJobId', 'fk_rc_recheck_count', 'fk_views_recheck_count',
         'fk_returns_recheck_count', 'fk_listings_recheck_count', 'fk_listings_gen_date',
+        '_pendingRetryJobIds',
       ]);
       console.log('[Rumee] KILL ALL — sync aborted + recheck alarms cleared');
       sendResponse({ ok: true });
@@ -832,6 +895,57 @@ async function handlePanelLoginRequired(msg) {
 
 // ─── Job result helpers ───────────────────────────────────────────────────────
 
+// Single-shot jobs (no submit/wait split, unlike fk_orders/fk_payments/fk_returns)
+// whose gap-catchup outcome is recorded centrally here in markJobResult, rather
+// than inside each content-script handler. Extend this list as each job is
+// added to the staged rollout (see how-i-work item 18 in project memory).
+const SINGLE_SHOT_GC_JOBS = [
+  'me_payments', 'me_orders', 'me_ads',
+  'fk_ads_daily', 'fk_ads_fsn', 'fk_ads_placements', 'fk_ads_overall',
+  'fk_ads_search', 'fk_ads_orders', 'fk_ads_kw',
+];
+
+async function gcIsEnabledForBg(jobId) {
+  const { gapCatchupEnabled = false, gapCatchupJobs = [] } = await chrome.storage.local.get(['gapCatchupEnabled', 'gapCatchupJobs']);
+  return gapCatchupEnabled && gapCatchupJobs.includes(jobId);
+}
+
+// Which DATA date this job's next navigation should fetch — never a "run
+// date" (see gap-catchup.js's header comment for that distinction: a failure
+// on today's run means YESTERDAY's data is what's owed, not today's date).
+// FK ads jobs each navigate fresh (see getEffectiveStartUrl) rather than
+// reading date state mid-run, so this only needs to answer "which date for
+// this job's NEXT navigation" — same pending-lookup logic as the
+// content-script version (gcSingleShotTargetDate in meesho.js).
+async function gcFkAdsTargetDate(jobId) {
+  if (!(await gcIsEnabledForBg(jobId))) return yesterdayISOBg();
+  const { gapCatchupPending = {} } = await chrome.storage.local.get(['gapCatchupPending']);
+  const oldest = gcGetOldestPending(gapCatchupPending, jobId);
+  return oldest ? oldest.date : yesterdayISOBg();
+}
+
+// Record a single-shot job's success/failure into gap-catchup tracking.
+// No-op for any job not in SINGLE_SHOT_GC_JOBS or not enabled — existing
+// behavior for every other job is completely unaffected.
+async function recordSingleShotGapCatchup(jobId, success) {
+  if (!SINGLE_SHOT_GC_JOBS.includes(jobId)) return;
+  if (!(await gcIsEnabledForBg(jobId))) return;
+
+  // Whatever date this run actually targeted: the oldest pending date if one
+  // was being retried (same lookup gcSingleShotTargetDate/gcFkAdsTargetDate
+  // used to pick it before the run started), otherwise the normal "yesterday".
+  // Must NOT just assume "yesterday" here — that would misrecord a retry
+  // attempt's outcome against today's date instead of the date actually retried.
+  const { gapCatchupPending = {} } = await chrome.storage.local.get(['gapCatchupPending']);
+  const oldest = gcGetOldestPending(gapCatchupPending, jobId);
+  const targetDate = oldest ? oldest.date : yesterdayISOBg();
+  const r = gcRecordOutcome(gapCatchupPending, jobId, targetDate, todayStr(), success);
+  await chrome.storage.local.set({ gapCatchupPending: r.pendingItems });
+  if (r.escalated) {
+    await handleGapCatchupEscalated(jobId, r.escalated.date, r.escalated.daysPending);
+  }
+}
+
 async function markJobResult(jobId, success, errMsg = null) {
   const { syncDone = [], syncFailed = [], lastRun = {} } =
     await chrome.storage.local.get(['syncDone', 'syncFailed', 'lastRun']);
@@ -847,6 +961,7 @@ async function markJobResult(jobId, success, errMsg = null) {
       syncFailed: [...syncFailed, { id: jobId, error: errMsg }],
     });
   }
+  await recordSingleShotGapCatchup(jobId, success);
   await chrome.storage.local.remove('currentJobId');
 }
 
@@ -923,7 +1038,7 @@ async function isRunning() {
 // ─── Utility ─────────────────────────────────────────────────────────────────
 
 function todayStr() {
-  return new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+  return istToday(); // 'YYYY-MM-DD', IST calendar day
 }
 
 function notify(title, message) {
@@ -933,6 +1048,40 @@ function notify(title, message) {
     title,
     message,
   });
+}
+
+// A gap-catchup retry gave up on a stuck date (content/flipkart.js and
+// content/meesho.js both send this). Record it so the popup can list it with
+// a "Mark Done" button, and post to Discord so it's visible even if nobody's
+// watching this machine. Desktop notification too, for parity with other
+// manual-action-required cases (see FK RC recheck exhaustion, above).
+// `reason` overrides the default "not resolved after N days" wording — used
+// by jobs (fk_returns_download) that skip retry/tracking entirely and
+// escalate on the very first failure, so "after N days" would be misleading.
+async function handleGapCatchupEscalated(jobId, date, daysPending, reason = null) {
+  const { gapCatchupManual = [] } = await chrome.storage.local.get('gapCatchupManual');
+  const already = gapCatchupManual.some(x => x.jobId === jobId && x.date === date);
+  if (!already) {
+    gapCatchupManual.push({ jobId, date, daysPending, escalatedAt: istDisplayString(Date.now()) });
+    await chrome.storage.local.set({ gapCatchupManual });
+  }
+
+  const detail = reason || `could not be auto-completed after ${daysPending} days`;
+  logError(jobId, `✗ GapCatchup: ${date} — ${detail} — manual download required`);
+  notify('Rumee — Manual Action Required',
+    `${jobId} for ${date}: ${detail}.\nPlease download manually and click "Mark Done" in the extension popup.`);
+
+  try {
+    await fetch(DISCORD_WEBHOOKS.AUTO_SYNC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content:
+        `⚠️ **Manual action needed** — \`${jobId}\` for **${date}**: ${detail}.\n` +
+        `Please download it manually and place it in the Drive folder, then click "Mark Done" in the extension popup.` }),
+    });
+  } catch (e) {
+    console.warn('[Rumee] GapCatchup Discord notify failed:', e.message);
+  }
 }
 
 // ─── ZIP extraction helper ────────────────────────────────────────────────────
@@ -1266,6 +1415,9 @@ async function closeCurrentTab() {
 let _pendingDownloadJob = null;
 // Backfill download: armed by BACKFILL_ARM, cleared after first use
 let _backfillDownload = null;
+// Relay-arm: armed by RELAY_ARM (jobs whose content script must fetch the
+// file itself for CORS reasons). Cleared after first use.
+let _relayArmedJobId = null;
 
 // ─── Chrome download interceptor ─────────────────────────────────────────────
 //
@@ -1284,6 +1436,16 @@ let _backfillDownload = null;
 // job is actively running). User-initiated downloads outside a sync are untouched.
 
 chrome.downloads.onCreated.addListener((item) => {
+  // ── RELAY PATH — content script needs the raw URL, not a background fetch ─
+  if (_relayArmedJobId) {
+    const jobId = _relayArmedJobId;
+    _relayArmedJobId = null;
+    chrome.downloads.cancel(item.id, () => { chrome.downloads.erase({ id: item.id }, () => {}); });
+    console.log(`[Rumee] downloads.onCreated (relay): intercepting for ${jobId} — ${item.url.slice(0, 120)}`);
+    chrome.storage.local.set({ _relayedDownload: { url: item.url, ts: Date.now() } });
+    return;
+  }
+
   // ── BACKFILL PATH — standalone backfill pages ─────────────────────────────
   if (_backfillDownload) {
     const bf = _backfillDownload;
@@ -1332,7 +1494,20 @@ chrome.downloads.onCreated.addListener((item) => {
 
   // ── SLOW FALLBACK PATH ────────────────────────────────────────────────────
   chrome.storage.local.get(['syncRunning', 'currentJobId', '_pendingFilenameOverride'], ({ syncRunning, currentJobId, _pendingFilenameOverride }) => {
-    if (!syncRunning || !currentJobId) return;
+    if (!syncRunning || !currentJobId) {
+      // Nothing armed at all — this download will show Chrome's native Save-As
+      // dialog uncontrolled. Record it (even though we can't intercept it) so
+      // a future session can tell whether this is a real recurring gap or a
+      // one-off — see rumee-auto-sync memory context.md for the investigation.
+      if (CDN_DOMAINS.test(item.url) || /meesho|flipkart/i.test(item.url)) {
+        console.warn(`[Rumee] UNCAPTURED download (nothing armed): ${item.url.slice(0, 160)}`);
+        chrome.storage.local.get({ uncapturedDownloads: [] }, ({ uncapturedDownloads }) => {
+          uncapturedDownloads.push({ ts: new Date().toISOString(), url: item.url.slice(0, 300), filename: item.filename || '' });
+          chrome.storage.local.set({ uncapturedDownloads: uncapturedDownloads.slice(-20) });
+        });
+      }
+      return;
+    }
 
     const job = JOBS.find(j => j.id === currentJobId);
     if (!job) return;
@@ -1471,6 +1646,19 @@ async function createDriveFolderStructure() {
   console.log('[Rumee] Service worker woke — resuming sync');
   await processNextJob();
 })();
+
+// ─── Sync retry alarm (collision recovery) ────────────────────────────────────
+// Fires when a targeted startSync() call (e.g. a recheck alarm) collided with
+// another sync already running and was dropped. See startSync()'s `running`
+// guard for how this gets scheduled.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'rumee_sync_retry') return;
+  const { _pendingRetryJobIds } = await chrome.storage.local.get('_pendingRetryJobIds');
+  if (!_pendingRetryJobIds || !_pendingRetryJobIds.length) return;
+  await chrome.storage.local.remove('_pendingRetryJobIds');
+  console.log(`[Rumee] rumee_sync_retry fired — retrying [${_pendingRetryJobIds.join(',')}]`);
+  await startSync(_pendingRetryJobIds);
+});
 
 // ─── FK RC Recheck Alarm ──────────────────────────────────────────────────────
 // Fires 1 hour after fk_rc_download found pending reports.

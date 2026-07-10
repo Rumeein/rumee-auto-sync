@@ -2,6 +2,14 @@
 // Loaded in both background (via importScripts) and content scripts (via manifest).
 // Edit ONLY this file to change folder IDs or add/remove jobs.
 
+// ── Per-tenant Meesho identifier ──────────────────────────────────────────────
+// The short slug that appears in every supplier.meesho.com panel URL for this
+// business. content/meesho.js detects this dynamically from the live page URL
+// wherever possible; this is the single source of truth for the few places
+// (new-tab bootstrap, standalone backfill tools) that need it before a Meesho
+// page is already loaded.
+const MEESHO_SUPPLIER_SLUG = 'xuptj';
+
 // ── Google Drive folder IDs ───────────────────────────────────────────────────
 const DRIVE_FOLDERS = {
   FK_ORDERS:   '1-LzJJo3Wi3x6YrUjYCm7SYm3x2tWQqko',

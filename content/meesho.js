@@ -28,9 +28,9 @@ if (!window.__rumeeInjected) {
 window.__rumeeInjected = true;
 
 // ── Supplier slug ─────────────────────────────────────────────────────────────
-// Short ID that appears in all panel URLs (e.g. "xuptj").
-// Read from the URL at runtime; this is the compile-time fallback only.
-const SUPPLIER_SLUG_FALLBACK = 'xuptj';
+// Short ID that appears in all panel URLs. Read from the URL at runtime;
+// MEESHO_SUPPLIER_SLUG (config.js) is the compile-time fallback only.
+const SUPPLIER_SLUG_FALLBACK = MEESHO_SUPPLIER_SLUG;
 
 // ── Target page definitions ───────────────────────────────────────────────────
 const JOB_PAGES = {
@@ -509,10 +509,31 @@ async function clickAndWait(el, ms = 800) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function todayISO()        { return new Date().toISOString().slice(0, 10); }
+function todayISO()        { return istToday(); }
 function yesterdayISO()    { return daysAgoISO(1); }
-function daysAgoISO(n)     { const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0, 10); }
-function addDays(iso, n)   { const d = new Date(iso); d.setDate(d.getDate() + n); return d.toISOString().slice(0, 10); }
+function daysAgoISO(n)     { return istDaysAgo(n); }
+function addDays(iso, n)   { return istAddDays(iso, n); }
+
+// ─── Gap catch-up (single-shot jobs) ───────────────────────────────────────────
+// See gap-catchup.js and how-i-work item 18 in project memory. Disabled by
+// default; only enabled per-job via gapCatchupJobs during staged rollout.
+async function gcIsEnabledFor(jobId) {
+  const { gapCatchupEnabled = false, gapCatchupJobs = [] } = await getStorage(['gapCatchupEnabled', 'gapCatchupJobs']);
+  return gapCatchupEnabled && gapCatchupJobs.includes(jobId);
+}
+
+// Which DATA date to fetch this run — never a "run date" (see gap-catchup.js's
+// header comment for that distinction). Example: today's run normally fetches
+// yesterday's data; but if a PAST run failed to fetch some earlier date's data,
+// that earlier date is what's "owed" and gets retried first, before today's
+// own normal (yesterday's) data. No-op — always plain yesterday — unless
+// gap-catchup is enabled for this job.
+async function gcSingleShotTargetDate(jobId) {
+  if (!(await gcIsEnabledFor(jobId))) return yesterdayISO();
+  const { gapCatchupPending = {} } = await getStorage(['gapCatchupPending']);
+  const oldest = gcGetOldestPending(gapCatchupPending, jobId);
+  return oldest ? oldest.date : yesterdayISO();
+}
 
 /**
  * Build a dated filename for Drive uploads.
@@ -726,9 +747,9 @@ async function handleViews(job) {
     const m1 = txt.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})/i);
     const m2 = txt.match(/(\d{2})\/(\d{2})\/(\d{4})/);
     if (m1) {
-      const MONTHS = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
-      dataDate = new Date(parseInt(m1[3]), MONTHS[m1[2].toLowerCase().slice(0,3)], parseInt(m1[1]))
-        .toISOString().slice(0, 10);
+      const MONTHS = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12 };
+      const mm = MONTHS[m1[2].toLowerCase().slice(0,3)];
+      dataDate = `${m1[3]}-${String(mm).padStart(2,'0')}-${String(parseInt(m1[1])).padStart(2,'0')}`;
       break;
     }
     if (m2) {
@@ -853,13 +874,14 @@ async function handleOrders(job) {
 
   await sleep(4000 + Math.random() * 1000);
 
-  // ── Date range: always yesterday only ─────────────────────────────────────
-  // fromDate and toDate are both yesterday (today − 1).
-  // We do NOT use lastRun — the dashboard independently tracks "data available
-  // up to" and determines whether a backfill is needed; the extension always
-  // downloads exactly one day so files stay small and uploads stay fast.
-  const fromDate = yesterdayISO();
-  const toDate   = yesterdayISO();
+  // ── Date range: normally yesterday only ────────────────────────────────────
+  // The dashboard independently tracks "data available up to" and determines
+  // whether a backfill is needed; the extension normally downloads exactly one
+  // day so files stay small and uploads stay fast. If gap-catchup is enabled
+  // and a previous day's download failed, retry that date first instead.
+  const targetDate = await gcSingleShotTargetDate('me_orders');
+  const fromDate = targetDate;
+  const toDate   = targetDate;
 
   console.log(`[Rumee/ME] Orders: requesting ${fromDate} → ${toDate}`);
 
@@ -1118,10 +1140,13 @@ async function handlePayments(job) {
   await sleep(4000 + Math.random() * 1000);
 
   // ── Determine date range ──────────────────────────────────────────────────
-  // Always yesterday only — the dashboard independently tracks "data available
-  // up to" and triggers backfills if needed. Extension just downloads one day.
-  const fromDate = yesterdayISO();
-  const toDate   = yesterdayISO();
+  // Normally yesterday only — the dashboard independently tracks "data
+  // available up to" and triggers backfills if needed, extension just
+  // downloads one day. If gap-catchup is enabled and a previous day's
+  // download failed, retry that date first instead (see gcSingleShotTargetDate).
+  const targetDate = await gcSingleShotTargetDate('me_payments');
+  const fromDate = targetDate;
+  const toDate   = targetDate;
 
   console.log(`[Rumee/ME] Payments: ${fromDate} → ${toDate}`);
 
@@ -1167,10 +1192,18 @@ async function handlePayments(job) {
 
   // ── Click "Download" button in modal ─────────────────────────────────────
   // The modal has a real <button> — use exact-text match to skip the dropdown <P>.
-  const finalDlBtn = Array.from(document.querySelectorAll('button'))
-    .find(el => el.offsetParent && el.textContent.trim().toLowerCase() === 'download')
-    || findBtn('Confirm') || findBtn('Submit');
-  if (!finalDlBtn) throw new Error('ME_PAYMENTS: final Download button not found');
+  // Retry up to 5× (2s apart) — same pattern as the dropdown above, since the
+  // modal can still be re-rendering right after fillMeeshoDates.
+  let finalDlBtn = null;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    finalDlBtn = Array.from(document.querySelectorAll('button'))
+      .find(el => el.offsetParent && el.textContent.trim().toLowerCase() === 'download')
+      || findBtn('Confirm') || findBtn('Submit');
+    if (finalDlBtn) break;
+    console.warn(`[Rumee/ME] Payments: final Download button not found (attempt ${attempt}/5) — waiting 2s`);
+    await sleep(2000);
+  }
+  if (!finalDlBtn) throw new Error('ME_PAYMENTS: final Download button not found after 5 attempts');
 
   const paymentsFilename = makeDatedFilename(job, fromDate, toDate);
   console.log(`[Rumee/ME] Payments: downloading as ${paymentsFilename}`);
@@ -1212,7 +1245,7 @@ async function handleAds(job) {
   if (!supplierId) throw new Error('ME_ADS: could not determine numeric supplier ID from localStorage');
 
   const sessionHeaders = { 'identifier': slug, 'client-type': 'd-web', 'browser-id': '', 'supplier-id': supplierId };
-  const targetDate = yesterdayISO();   // data date
+  const targetDate = await gcSingleShotTargetDate('me_ads');   // data date (retries a failed past date first if any)
   const runDate    = todayISO();        // master "Last Updated"
   console.log(`[Rumee/ME] Ads: slug=${slug}, supplierId=${supplierId}, target=${targetDate}`);
 

@@ -44,33 +44,33 @@ const _FK_ADS_CACHE_KEY = 'fkAdsCampaignCache';
 async function _getCampaignCache() {
   const stored = await chrome.storage.local.get(_FK_ADS_CACHE_KEY);
   const cache = stored[_FK_ADS_CACHE_KEY];
-  if (!cache || cache.date !== yesterdayISO()) return null; // missing or stale
+  // Compare against THIS run's actual target date (URL-derived), not a blind
+  // yesterdayISO() — otherwise a gap-catchup retry for an older date would
+  // always see the cache as "stale" even when fk_ads_daily just set it
+  // correctly for that same retried date.
+  if (!cache || cache.date !== _fkAdsCurrentTargetDate()) return null; // missing or stale
   return cache;
-}
-
-async function _setCampaignCache(ids) {
-  await chrome.storage.local.set({
-    [_FK_ADS_CACHE_KEY]: { date: yesterdayISO(), ids }
-  });
 }
 
 const HANDLERS_FK = {
   fk_orders:          handleFkReportsCentre,   // requestOnly: submits request, no poll
-  fk_returns:         handleFkReportsCentre,   // requestOnly: submits request, no poll
-  fk_payments:        handleFkReportsCentre,   // requestOnly: submits request, no poll
-  fk_rc_download:     handleFkRCDownload,      // runs last: polls all 3, downloads, reschedules
-  fk_ads_daily:       handleFkAds,
-  fk_ads_fsn:         handleFkAds,
-  fk_ads_placements:  handleFkAds,
-  fk_ads_overall:     handleFkAds,
-  fk_ads_search:      handleFkAds,
-  fk_ads_orders:      handleFkAds,
-  fk_ads_kw:          handleFkAds,
-  fk_views_request:   handleFkViewsRequest,   // phase 1: submit listings-report request (early)
-  fk_views:           handleFkViewsDownload,  // phase 2: download when ready (runs after fk_rc_download)
-  fk_keywords:        handleFkKeywords,
+  fk_returns:          handleFkReturnsRequest,  // phase 1: submit request only
+  fk_payments:         handleFkReportsCentre,  // requestOnly: submits request, no poll
+  fk_rc_download:      handleFkRCDownload,     // polls fk_orders + fk_payments, downloads, reschedules
+  fk_ads_daily:        handleFkAds,
+  fk_ads_fsn:          handleFkAds,
+  fk_ads_placements:   handleFkAds,
+  fk_ads_overall:      handleFkAds,
+  fk_ads_search:       handleFkAds,
+  fk_ads_orders:       handleFkAds,
+  fk_ads_kw:           handleFkAds,
+  fk_views_request:    handleFkViewsRequest,  // phase 1: submit listings-report request (early)
+  fk_views:            handleFkViewsDownload, // phase 2: download when ready (runs after fk_rc_download)
+  fk_returns_download: handleFkReturnsDownload, // phase 2: poll + download (runs before fk_keywords)
+  fk_keywords:         handleFkKeywords,
   fk_claims:          handleFkClaims,
   fk_listings:        handleFkListings,
+  fk_listings_download: handleFkListingsDownload,
 };
 
 // Reports Centre sub-type config â€” identifies which row to click per job.
@@ -81,7 +81,6 @@ const REPORTS_CENTRE_CFG = {
   // requestOnly: true â€” submit request and return immediately (no polling)
   // Polling + download handled by fk_rc_download (last job)
   fk_orders:   { categoryTab: 'Fulfilment', skipCategoryTab: true, subType: 'orders',               requestType: 'Fulfilment Reports', requestSubType: 'Orders',               requestOnly: true },
-  fk_returns:  { categoryTab: 'Fulfilment', skipCategoryTab: true, subType: 'returns',              requestType: 'Fulfilment Reports', requestSubType: 'Returns',              requestOnly: true },
   fk_payments: { categoryTab: null,         skipCategoryTab: true, subType: 'settled transactions', requestType: 'Payment Reports',    requestSubType: 'Settled Transactions', requestOnly: true },
 };
 
@@ -123,6 +122,20 @@ const REPORTS_CENTRE_CFG = {
   } catch (err) {
     console.error(`[Rumee/FK] âœ– ${job.id}:`, err);
     reportError(job.id, err.message || String(err));
+
+    // FK Returns is deliberately excluded from gap-catchup's auto-retry (see
+    // how-i-work item 18 in project memory) â€” FK's own panel doesn't show
+    // which date a pending request is for, only an approximate timestamp,
+    // so automated retry risks silently matching the wrong date. Instead of
+    // auto-retrying, flag it for manual download immediately on the very
+    // first failure â€” reuses the same Discord notify + popup "Mark Done"
+    // list gap-catchup already has for the auto-retry jobs, just skipping
+    // straight to it with no retry attempt of its own.
+    if (job.id === 'fk_returns_download') {
+      chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: job.id,
+        date: yesterdayISO(), daysPending: 1,
+        reason: 'FK Returns could not be matched to a ready download automatically' });
+    }
   }
 })();
 
@@ -348,11 +361,8 @@ async function dismissFkPopups() {
   }
 }
 
-function todayISO() { return new Date().toISOString().slice(0, 10); }
-function daysAgoISO(n) {
-  const d = new Date(); d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
-}
+function todayISO() { return istToday(); }
+function daysAgoISO(n) { return istDaysAgo(n); }
 
 /** Build a dated filename: flipkart_orders_2026-05-31.xlsx */
 function makeDatedFilename(job, fromDate, toDate) {
@@ -365,9 +375,18 @@ function makeDatedFilename(job, fromDate, toDate) {
 // Set to a date string (e.g. '2026-06-01') to test a specific date, or null for real yesterday
 const _YESTERDAY_OVERRIDE = null;
 function yesterdayISO() { return (_YESTERDAY_OVERRIDE != null) ? _YESTERDAY_OVERRIDE : daysAgoISO(1); }
-function addDays(isoDate, n) {
-  const d = new Date(isoDate); d.setDate(d.getDate() + n);
-  return d.toISOString().slice(0, 10);
+function addDays(isoDate, n) { return istAddDays(isoDate, n); }
+
+// The DATA date this ads job is fetching (never a "run date" — see gap-catchup.js's
+// header for that distinction). FK ads jobs navigate with ?duration=YYYY-MM-DD_YYYY-MM-DD
+// already set by background.js's getEffectiveStartUrl (gap-catchup-aware — normally
+// yesterday's data, a retried older data-date if one's still owed). Reading it back
+// from the URL instead of independently recomputing yesterdayISO() is the single
+// source of truth, so every date reference within one ads job run agrees, including
+// on a retry — the content script never has to know or guess which case it's in.
+function _fkAdsCurrentTargetDate() {
+  const m = window.location.hash.match(/duration=(\d{4}-\d{2}-\d{2})_/);
+  return m ? m[1] : yesterdayISO();
 }
 
 /** Dump all interactive elements to console AND to the extension log. */
@@ -390,6 +409,23 @@ function setStorage(obj) {
   return new Promise(resolve => chrome.storage.local.set(obj, resolve));
 }
 
+// Polls for the URL relayed by background.js's RELAY_ARM interceptor (see
+// chrome.downloads.onCreated in background.js). Used instead of the
+// fetch/XHR-only postMessage relay for downloads that can be triggered via
+// window.open/native navigation, which that relay can never see.
+async function pollStorageForRelay(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { _relayedDownload } = await getStorage('_relayedDownload');
+    if (_relayedDownload) {
+      await new Promise(res => chrome.storage.local.remove('_relayedDownload', res));
+      return _relayedDownload;
+    }
+    await sleep(300);
+  }
+  return null;
+}
+
 // â”€â”€ Download interception â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // URL patterns that indicate a file download rather than a normal API call.
@@ -408,57 +444,6 @@ const FK_DOWNLOAD_PATTERNS = [
 
 function looksLikeDownload(url) {
   return typeof url === 'string' && FK_DOWNLOAD_PATTERNS.some(p => p.test(url));
-}
-
-/**
- * Wait for the MAIN-world intercept.js to capture the next download URL.
- *
- * content/intercept.js (world: MAIN) patches the page's real fetch/XHR/anchor
- * and posts {__rumeeDownload: true, url, headers} via window.postMessage when
- * window.__rumeeIntercepting is true.  We set that flag here, listen for the
- * message, then clear the flag.
- *
- * Resolves with { url, headers, referer }.
- */
-function interceptNextDownload(timeout = TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      window.__rumeeIntercepting = false;
-      window.removeEventListener('message', onMsg);
-      debugPage('download-timeout');
-      reject(new Error('interceptNextDownload: no download captured within timeout'));
-    }, timeout);
-
-    function onMsg(event) {
-      if (!event.data?.__rumeeDownload) return;
-      if (settled) return;
-
-      const { url, headers } = event.data;
-      // Skip internal Flipkart API calls that accidentally match _DOWNLOAD_PATTERNS
-      // e.g. /napi/metrics/bizReport/getReportsCount matches /getReport/i but is not a file
-      const isFalsePositive = /getReportsCount|bizReport\/get[A-Za-z]|\/metrics\/.*\/get[A-Za-z]/i.test(url);
-      if (isFalsePositive) {
-        console.log(`[Rumee/FK] Ignoring false-positive URL: ${url.slice(0, 80)} â€” keeping intercept armed`);
-        return; // don't settle â€” keep waiting for the real download URL
-      }
-
-      settled = true;
-      clearTimeout(timer);
-      window.__rumeeIntercepting = false;
-      window.removeEventListener('message', onMsg);
-      console.log(`[Rumee/FK] âœ“ MAIN-world captured: ${url.slice(0, 160)}`);
-      resolve({ url, headers: headers || {}, referer: window.location.href });
-    }
-
-    window.addEventListener('message', onMsg);
-    window.__rumeeIntercepting = true;
-    // Mirror to MAIN world (isolated world flags not visible to MAIN world)
-    window.postMessage({ __rumeeArmCapture: true, __rumeeCapturingBlob: false }, '*');
-  });
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -672,6 +657,58 @@ async function handleFkReportsCentre(job) {
   }
 }
 
+// ─── Gap catch-up (two-phase FK jobs: fk_orders / fk_payments) ────────────────
+// Purely additive on top of the existing Reports Centre flow above. Disabled
+// by default (kill switch); only enabled per-job via gapCatchupJobs during
+// staged rollout. See gap-catchup.js for the pure decision logic, and
+// how-i-work item 18 in project memory for the full design.
+
+async function gcIsEnabledFor(jobId) {
+  const { gapCatchupEnabled = false, gapCatchupJobs = [] } = await getStorage(['gapCatchupEnabled', 'gapCatchupJobs']);
+  return gapCatchupEnabled && gapCatchupJobs.includes(jobId);
+}
+
+// Runs at the top of _handleFkReportsCentreInner (already on the Reports Centre
+// page). If a previous day's order for this job was never successfully
+// submitted, retry submitting it now — before today's own request happens via
+// the unchanged code below. No-op if catch-up is off, or nothing is stuck at
+// "not yet submitted" (an already-submitted-but-not-ready order is handled by
+// gcCheckFkRCPending in fk_rc_download instead, not here).
+async function gcAttemptFkPlacementCatchup(job, cfg) {
+  if (!(await gcIsEnabledFor(job.id))) return;
+
+  const { gapCatchupPending = {} } = await getStorage(['gapCatchupPending']);
+  const oldest = gcGetOldestPending(gapCatchupPending, job.id);
+  if (!oldest || oldest.placed) return;
+
+  const today = todayISO();
+  chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id,
+    text: `GapCatchup: retrying stuck submission for ${oldest.date} (day ${oldest.daysPending})` });
+
+  let success = false;
+  try {
+    await requestNewFkReport(cfg, oldest.date, job.id);
+    success = true;
+  } catch (e) {
+    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id,
+      text: `GapCatchup: retry submit failed for ${oldest.date}: ${e.message}` });
+  }
+
+  let pending = gapCatchupPending;
+  if (success) {
+    pending = gcMarkPlaced(pending, job.id, oldest.date);
+    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id,
+      text: `GapCatchup: ${oldest.date} submitted ✓ — now awaiting ready` });
+  } else {
+    const r = gcRecordOutcome(pending, job.id, oldest.date, today, false);
+    pending = r.pendingItems;
+    if (r.escalated) {
+      chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: job.id, date: r.escalated.date, daysPending: r.escalated.daysPending });
+    }
+  }
+  await new Promise(res => chrome.storage.local.set({ gapCatchupPending: pending }, res));
+}
+
 async function _handleFkReportsCentreInner(job, cfg) {
   console.log(`[Rumee/FK] ReportsCentre: job=${job.id} category="${cfg.categoryTab}" subType="${cfg.subType}"`);
 
@@ -681,6 +718,10 @@ async function _handleFkReportsCentreInner(job, cfg) {
   // the button to be absent.
   await ensureOnReportsCentre(true);
   await sleep(2000);
+
+  // â”€â”€ Gap catch-up: retry a stuck-from-a-previous-day submission first, if any â”€
+  // (no-op unless explicitly enabled for this job â€” see gcIsEnabledFor above)
+  await gcAttemptFkPlacementCatchup(job, cfg);
 
   // â”€â”€ Step 2: ensureOnReportsCentre already navigated to Requested tab via URL â”€â”€
 
@@ -727,7 +768,24 @@ async function _handleFkReportsCentreInner(job, cfg) {
       console.log(`[Rumee/FK] Already requested ${job.id} for ${yesterday} â€” skipping request`);
     } else {
       console.log(`[Rumee/FK] Requesting "${cfg.requestSubType}" for ${yesterday}`);
-      await requestNewFkReport(cfg, yesterday, job.id);
+      const gcOn = await gcIsEnabledFor(job.id);
+      try {
+        await requestNewFkReport(cfg, yesterday, job.id);
+      } catch (e) {
+        // Submission itself failed outright (not just "slow to generate" â€” that
+        // case is handled separately in handleFkRCDownload's recheck-exhaustion
+        // branch). Track it so tomorrow's run retries the submission, instead
+        // of just failing today and moving on.
+        if (gcOn) {
+          const { gapCatchupPending = {} } = await getStorage(['gapCatchupPending']);
+          const r = gcRecordOutcome(gapCatchupPending, job.id, yesterday, todayISO(), false);
+          await new Promise(res => chrome.storage.local.set({ gapCatchupPending: r.pendingItems }, res));
+          if (r.escalated) {
+            chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: job.id, date: r.escalated.date, daysPending: r.escalated.daysPending });
+          }
+        }
+        throw e; // preserve existing behavior â€” job is still marked failed today
+      }
       await new Promise(res => chrome.storage.local.set({ [requestedKey]: yesterday }, res));
       console.log(`[Rumee/FK] Request saved: ${requestedKey}=${yesterday}`);
       await sleep(3000);
@@ -807,10 +865,11 @@ async function _handleFkReportsCentreInner(job, cfg) {
  *                              done and advances the queue. When false: sends UPLOAD_DATA_SILENT
  *                              which only uploads without touching the queue. Caller is
  *                              responsible for sending JOB_DONE when all uploads finish.
- * @param {boolean} useLayer2   When true: use chrome.downloads.onCreated (Layer 2) instead of
- *                              interceptNextDownload (Layer 1). Layer 2 is required for Flipkart
- *                              Ads Other Reports, where the Download button triggers a browser
- *                              navigation (not a fetch/XHR) â€” Layer 1 captures the wrong URL.
+ * @param {boolean} useLayer2   When true: use blob capture (URL.createObjectURL interception,
+ *                              Layer 2) instead of the RELAY_ARM download-URL capture (Layer 1).
+ *                              Layer 2 is required for Flipkart Ads Other Reports, where the
+ *                              Download button POSTs and builds a Blob client-side rather than
+ *                              triggering a real navigable download URL.
  */
 async function _downloadFkReport(job, dlBtn, filename, signalDone = true, useLayer2 = false) {
   console.log(`[Rumee/FK] Downloading for ${job.id} as ${filename} (layer=${useLayer2 ? 2 : 1})`);
@@ -884,13 +943,18 @@ async function _downloadFkReport(job, dlBtn, filename, signalDone = true, useLay
     return;
   }
 
-  // Layer 1: intercept the fetch/XHR URL via main-world injection (for non-ads FK jobs)
-  _handlingDownloadInContentScript = true;
-  const capturePromise = interceptNextDownload(TIMEOUT_MS);
+  // Layer 1: RELAY_ARM — background's chrome.downloads.onCreated catches the
+  // real URL regardless of trigger mechanism (fetch/XHR/click/window.open),
+  // cancels synchronously (no Save-As dialog possible), relays URL back.
+  await new Promise(res => chrome.runtime.sendMessage({ type: 'RELAY_ARM', jobId: job.id }, res));
   await clickAndWait(dlBtn, 300);
-  let captured;
-  try { captured = await capturePromise; }
-  finally { _handlingDownloadInContentScript = false; _currentJob = job; }
+  const relayed = await pollStorageForRelay(TIMEOUT_MS);
+  _currentJob = job;
+  if (!relayed) {
+    chrome.runtime.sendMessage({ type: 'RELAY_DISARM' });
+    throw new Error(`FK: no relayed download URL within timeout for ${job.id}`);
+  }
+  const captured = { url: relayed.url, headers: {} };
 
   const resp = await fetch(captured.url, { credentials: 'include', headers: captured.headers || {} });
   if (!resp.ok) throw new Error(`FK fetch failed: ${resp.status}`);
@@ -913,9 +977,17 @@ async function _downloadFkReport(job, dlBtn, filename, signalDone = true, useLay
  */
 async function requestNewFkReport(cfg, date, jobId = 'fk_report') {
   // â”€â”€ Step A: Click "Request New Report" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  const reqBtn = findEl(['Request New Report'], 'button, [role="button"]')
-    || findBtn('Request New Report');
-  if (!reqBtn) throw new Error(`FK_REPORTS: "Request New Report" button not found â€” cannot submit ${cfg.requestSubType}`);
+  // Retry up to 5x2s -- the button can be missing if the SPA hasn't finished
+  // rendering yet (same class of failure that broke me_payments' download
+  // button -- a single immediate check was too strict).
+  let reqBtn = null;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    reqBtn = findEl(['Request New Report'], 'button, [role="button"]') || findBtn('Request New Report');
+    if (reqBtn) break;
+    console.warn(`[Rumee/FK] "Request New Report" button not found (attempt ${attempt}/5) -- waiting 2s`);
+    await sleep(2000);
+  }
+  if (!reqBtn) throw new Error(`FK_REPORTS: "Request New Report" button not found after 5 attempts â€” cannot submit ${cfg.requestSubType}`);
   await clickAndWait(reqBtn, 2500);
   console.log('[Rumee/FK] Opened "Request New Report" modal');
 
@@ -1384,7 +1456,7 @@ async function handleFkAds(job) {
   // cache miss â†’ fk_ads_daily may have been skipped or errored â†’ proceed anyway
   const _rawStored = await chrome.storage.local.get(_FK_ADS_CACHE_KEY);
   const _storedCache = _rawStored[_FK_ADS_CACHE_KEY];
-  await _log(`CACHE: stored.date=${_storedCache?.date||'none'}  ids=${_storedCache?.ids===undefined?'undef':_storedCache?.ids===null?'null':Array.isArray(_storedCache?.ids)?_storedCache.ids.length+'arr':'?'}  yesterday=${yesterdayISO()}`);
+  await _log(`CACHE: stored.date=${_storedCache?.date||'none'}  ids=${_storedCache?.ids===undefined?'undef':_storedCache?.ids===null?'null':Array.isArray(_storedCache?.ids)?_storedCache.ids.length+'arr':'?'}  target=${_fkAdsCurrentTargetDate()}`);
 
   if (job.id !== 'fk_ads_daily') {
     const campaignCache = await _getCampaignCache();
@@ -1408,7 +1480,7 @@ async function handleFkAds(job) {
   //   https://seller.flipkart.com/index.html#dashboard/ads/reports/others?duration=DATE_DATE
   // This is a clean single-# navigation â€” React mounts fresh and may read ?duration=.
   // We just wait for the SPA to boot and verify the page is correct.
-  const _step1Date = yesterdayISO(); // e.g. "2026-06-01"
+  const _step1Date = _fkAdsCurrentTargetDate(); // e.g. "2026-06-01" — normally yesterday, a retried date if gap-catchup is active
 
   await sleep(6000); // wait for React route change + initial data load
   await waitForSpaBootstrap();
@@ -1574,7 +1646,7 @@ async function handleFkAds(job) {
   // correct date and we can skip this step entirely.
   // If not (FK ignores ?duration= even on fresh mount), we interact with the date picker.
   await _log('Step4: checking date on page');
-  const _yISO = yesterdayISO(); // e.g. "2026-06-01"
+  const _yISO = _fkAdsCurrentTargetDate(); // e.g. "2026-06-01" — normally yesterday, a retried date if gap-catchup is active
 
   // Convert ISO date to FK display format variants: "01-Jun-2026", "1-Jun-2026", "01-Jun-26"
   const _MONTHS_3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -1826,7 +1898,7 @@ async function handleFkAds(job) {
     throw new Error(`Ads Download button not found for ${job.id} / ${job.adsReportType}`);
   }
   console.log(`[Rumee/FK] Downloading: ${job.adsReportType}`);
-  const filename = makeDatedFilename(job, yesterdayISO(), yesterdayISO());
+  const filename = makeDatedFilename(job, _fkAdsCurrentTargetDate(), _fkAdsCurrentTargetDate());
 
   // Layer 2: background.js chrome.downloads.onCreated intercepts the real browser-navigation
   // download (Sec-Fetch-Dest: document â†’ CSV). For fk_ads_daily, background also sets the
@@ -1842,237 +1914,6 @@ async function handleFkAds(job) {
     chrome.runtime.sendMessage({ type: 'JOB_ERROR', jobId: job.id, error: err.message || String(err) });
   }
 }
-
-/**
- * Navigate to Campaign Manager, filter to Yesterday, and return the IDs of
- * campaigns that had Ad spends > 0 (i.e. were actually running that day).
- *
- * Result is cached in _fkAdsCampaignIds so the Campaign Manager navigation
- * only happens once per run (on fk_ads_daily, the first FK ads job).
- */
-async function _getActiveCampaignIds(jobId) {
-  chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-    text: 'Checking Campaign Manager for active campaigns yesterday...' });
-
-  window.location.hash = '#dashboard/ads/campaigns';
-  await sleep(5000);
-  await dismissFkPopups();
-
-  // No date filtering â€” use whatever date range is currently shown.
-  // The CSV is filtered by spend > 0, which is sufficient to identify active campaigns.
-  // Wait for the campaign table to fully load before clicking Actions.
-  await sleep(3000);
-  chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-    text: 'CampaignMgr: page loaded â€” going straight to Actions â†’ Download (no date filter)' });
-
-  // â”€â”€ Poll for Actions button (up to 12s) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // The button may render after the table data loads. Its text may have an icon
-  // before "Actions" (SVG icons â†’ textContent doesn't start with "Actions"),
-  // and the element may not be a <button> â€” use /\bActions\b/ + broad selector.
-  let actionsBtn = null;
-  for (let i = 0; i < 24; i++) {
-    actionsBtn = Array.from(document.querySelectorAll(
-      'button, [role="button"], a, div[class], span[class]'
-    ))
-      .filter(el => el.offsetParent !== null)
-      .find(el => {
-        const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        return /\bActions\b/i.test(t) && t.length < 60;
-      });
-    if (actionsBtn) break;
-    await sleep(500);
-  }
-
-  chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-    text: `CampaignMgr: Actions button found=${!!actionsBtn}  text="${(actionsBtn?.textContent||'').trim().slice(0,40)}"` });
-
-  if (!actionsBtn) {
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-      text: 'CampaignMgr: STOP â€” "Actions" button not found after 12s wait. Cannot get campaign data.' });
-    return null;
-  }
-
-  // Note actionsBtn position before click â€” used to find the nearby dropdown.
-  const _actionsRect = actionsBtn.getBoundingClientRect();
-
-  await clickAndWait(actionsBtn, 1000);
-
-  // Find the "Download" menu item by position proximity to the Actions button.
-  // React reuses DOM nodes so text-node identity snapshots are unreliable â€”
-  // instead find any visible leaf element whose text is "Download" and whose
-  // bounding rect is near (within 400px) the Actions button that was clicked.
-  const _findDownloadItem = () => {
-    const candidates = Array.from(document.querySelectorAll('*'))
-      .filter(el => {
-        if (!el.offsetParent) return false;
-        if ((el.textContent || '').trim() !== 'Download') return false;
-        // Must be a leaf or near-leaf (no significant child text nodes)
-        const directText = Array.from(el.childNodes)
-          .filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join('');
-        if (!directText && el.children.length > 0) return false;
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) return false;
-        // Must be within 400px in any direction of Actions button
-        // (dropdown may open upward when button is near bottom of viewport)
-        const dx = Math.abs(r.left - _actionsRect.left);
-        const dy = Math.abs(r.top - _actionsRect.top);
-        return dx < 400 && dy < 400;
-      });
-    if (!candidates.length) return null;
-    // Pick closest to the Actions button
-    candidates.sort((a, b) => {
-      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-      return (Math.abs(ra.left - _actionsRect.left) + Math.abs(ra.top - _actionsRect.top))
-           - (Math.abs(rb.left - _actionsRect.left) + Math.abs(rb.top - _actionsRect.top));
-    });
-    return candidates[0];
-  };
-
-  // Poll up to 4s
-  let dlOption = null;
-  for (let i = 0; i < 8 && !dlOption; i++) {
-    dlOption = _findDownloadItem();
-    if (!dlOption) await sleep(500);
-  }
-
-  // Diagnostic: log all visible "Download" elements and their positions
-  const _allDls = Array.from(document.querySelectorAll('*'))
-    .filter(el => el.offsetParent !== null && /\bDownload\b/i.test((el.textContent||'').trim()) && el.children.length === 0)
-    .map(el => { const r = el.getBoundingClientRect(); return `${el.tagName}[${Math.round(r.left)},${Math.round(r.top)}]`; })
-    .slice(0, 8).join(' | ');
-  const _actionsPos = `Actions@[${Math.round(_actionsRect.left)},${Math.round(_actionsRect.top)}]`;
-  chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-    text: `CampaignMgr: Download found=${!!dlOption}  ${_actionsPos}  allDls=[${_allDls}]` });
-
-  if (!dlOption) {
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-      text: 'CampaignMgr: STOP â€” "Download" not found in Actions menu.' });
-    return null;
-  }
-
-  let csvText = '';
-  try {
-    // Use a raw intercept (no isFalsePositive filter) because the Campaign Manager
-    // download URL matches the false-positive pattern in interceptNextDownload and
-    // would be silently ignored, causing a 60s timeout.
-    // _handlingDownloadInContentScript = true prevents the module-level __rumeeDownload
-    // listener from dispatching this download as the job's actual ads report.
-    _handlingDownloadInContentScript = true;
-    window.__rumeeIntercepting = true;
-    window.postMessage({ __rumeeArmCapture: true, __rumeeCapturingBlob: false }, '*');
-    // Yield to event loop so main-world intercept.js processes __rumeeArmCapture
-    // and sets window.__rumeeIntercepting = true BEFORE the click fires a fetch.
-    await sleep(150);
-
-    const captured = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        window.removeEventListener('message', _onDl);
-        reject(new Error('Campaign Manager CSV: no download captured within 60s'));
-      }, 60000);
-      function _onDl(ev) {
-        if (!ev.data?.__rumeeDownload) return;
-        clearTimeout(timer);
-        window.removeEventListener('message', _onDl);
-        window.__rumeeIntercepting = false;
-        resolve(ev.data);
-      }
-      window.addEventListener('message', _onDl);
-      dlOption.click();
-    });
-
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-      text: `CampaignMgr: captured URL = ${captured.url.slice(0, 200)}  method=${captured.method||'GET'}  body=${(captured.body||'').slice(0,80)}` });
-
-    // Use __rumeeHttpPost proxy (main world _origFetch) to fetch the CSV.
-    // Content-script fetch gets HTML (SPA shell) for this URL because the server
-    // checks request context. _origFetch in the main world mimics the page's own
-    // request and gets the actual CSV response.
-    const reqId = `cm_${Date.now()}`;
-    const csvFetch = await new Promise((resolve2, reject2) => {
-      const t2 = setTimeout(() => { window.removeEventListener('message', _onProxy); reject2(new Error('proxy fetch timed out')); }, 30000);
-      function _onProxy(ev) {
-        if (!ev.data?.__rumeeHttpResult || ev.data.reqId !== reqId) return;
-        clearTimeout(t2);
-        window.removeEventListener('message', _onProxy);
-        if (ev.data.error) reject2(new Error(ev.data.error));
-        else resolve2(ev.data.text || JSON.stringify(ev.data.data || ''));
-      }
-      window.addEventListener('message', _onProxy);
-      window.postMessage({ __rumeeHttpGetText: true, url: captured.url, headers: captured.headers || {}, method: captured.method || 'GET', body: captured.body || null, reqId }, '*');
-    });
-    csvText = csvFetch;
-  } catch(e) {
-    _handlingDownloadInContentScript = false;
-    window.__rumeeIntercepting = false;
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-      text: `CampaignMgr: STOP â€” CSV download/fetch failed: ${e.message}` });
-    return null;
-  } finally {
-    _handlingDownloadInContentScript = false;
-    window.__rumeeIntercepting = false;
-  }
-
-  chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-    text: `CampaignMgr CSV: ${csvText.length} chars  header: "${csvText.split('\n')[0].slice(0,120)}"` });
-
-  // Parse CSV â€” structure:
-  //   Line 0: "Start Time, 2026-05-07 00:00:00"   â† metadata
-  //   Line 1: "End Time, 2026-06-06 23:59:59"     â† metadata
-  //   Line 2: "Campaign ID,Campaign Name,...,Ad Spend,..."  â† REAL headers
-  //   Line 3+: data rows
-
-  // Handle quoted CSV fields
-  const _parseRow = row => {
-    const cols = []; let cur = ''; let inQ = false;
-    for (const ch of row) {
-      if (ch === '"') { inQ = !inQ; }
-      else if (ch === ',' && !inQ) { cols.push(cur.trim()); cur = ''; }
-      else cur += ch;
-    }
-    cols.push(cur.trim());
-    return cols.map(c => c.replace(/^"|"$/g, '').trim());
-  };
-
-  const allLines = csvText.split('\n');
-
-  // Find the actual header row: first line containing "Campaign ID"
-  let headerLineIdx = allLines.findIndex(l => /campaign.?id/i.test(l));
-  if (headerLineIdx < 0) {
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-      text: 'CampaignMgr: STOP â€” CSV downloaded but "Campaign ID" header not found. Unexpected format.' });
-    return null;
-  }
-
-  const headers = _parseRow(allLines[headerLineIdx]);
-  const idIdx    = headers.findIndex(h => /^campaign.?id$/i.test(h));
-  const spendIdx = headers.findIndex(h => /^ad.?spend$/i.test(h));
-
-  chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-    text: `CampaignMgr CSV: headerLine=${headerLineIdx}  idIdx=${idIdx}  spendIdx=${spendIdx}  cols=[${headers.slice(0,7).join(' | ')}]` });
-
-  const ids = [];
-  for (let i = headerLineIdx + 1; i < allLines.length; i++) {
-    const line = allLines[i].trim();
-    if (!line) continue;
-    const cols = _parseRow(line);
-    const campaignId = idIdx >= 0 ? cols[idIdx] : '';
-    const spend = spendIdx >= 0 ? parseFloat(cols[spendIdx] || '0') : 0;
-    if (!campaignId || spend <= 0) continue;
-    if (!ids.includes(campaignId)) ids.push(campaignId);
-  }
-
-  if (ids.length === 0) {
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-      text: `CampaignMgr: 0 campaigns with Ad Spend > 0 on ${yesterdayISO()} â€” all 7 ads jobs will be skipped` });
-    return []; // confirmed no spend â†’ skip
-  }
-
-  chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
-    text: `CampaignMgr: ${ids.length} active campaigns â€” [${ids.join(' | ')}]` });
-  return ids;
-}
-
 
 /**
  * Overall Performance Report â€” requires Campaign ID (mandatory field).
@@ -2123,7 +1964,7 @@ async function _handleFkAdsOverall(job) {
     const campId = activeCampaignIds[i];
     const isLast = (i === activeCampaignIds.length - 1);
     const safeName = campId.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 30);
-    const filename = makeDatedFilename(job, yesterdayISO(), yesterdayISO())
+    const filename = makeDatedFilename(job, _fkAdsCurrentTargetDate(), _fkAdsCurrentTargetDate())
       .replace('.csv', activeCampaignIds.length > 1 ? `_${safeName}.csv` : '.csv');
 
     await _log(`Overall (${i + 1}/${activeCampaignIds.length}): "${campId}" â†’ "${filename}"`);
@@ -2512,12 +2353,21 @@ async function handleFkViewsDownload(job) {
 
   if (state.downloadBtn) {
     vlog('READY â€” downloading');
-    _handlingDownloadInContentScript = true;
-    const capturePromise = interceptNextDownload(TIMEOUT_MS);
+    // RELAY_ARM: background.js's chrome.downloads.onCreated fires with the
+    // real URL regardless of trigger mechanism (fetch, XHR, or window.open --
+    // this button opens a new tab, which intercept.js's fetch/XHR monkey-patch
+    // can never see). Background cancels synchronously (no Save-As dialog) and
+    // relays the URL back via storage; we still do our own fetch below since
+    // background's own fetch fails CORS for some FK endpoints.
+    await new Promise(res => chrome.runtime.sendMessage({ type: 'RELAY_ARM', jobId: job.id }, res));
     await clickAndWait(state.downloadBtn, 300);
-    let captured;
-    try { captured = await capturePromise; }
-    finally { _handlingDownloadInContentScript = false; _currentJob = job; }
+    const relayed = await pollStorageForRelay(TIMEOUT_MS);
+    if (!relayed) {
+      chrome.runtime.sendMessage({ type: 'RELAY_DISARM' });
+      throw new Error('FK_VIEWS: no relayed download URL within timeout');
+    }
+    const captured = { url: relayed.url, headers: {} };
+    _currentJob = job;
 
     const datedFilename = makeDatedFilename(job, to, to);
     const resp = await fetch(captured.url, { credentials: 'include', headers: captured.headers || {} });
@@ -2547,7 +2397,7 @@ async function handleFkViewsDownload(job) {
   const { fk_views_recheck_count = 0 } = await getStorage(['fk_views_recheck_count']);
   if (fk_views_recheck_count >= FK_VIEWS_MAX_RECHECKS) {
     chrome.runtime.sendMessage({ type: 'NOTIFY_USER',
-      title: 'âš ï¸ Rumee â€” FK Views Report Not Ready',
+      title: 'Rumee â€” FK Views Report Not Ready',
       message: `Views listings report (${from} â†’ ${to}) still not generated after ${FK_VIEWS_MAX_RECHECKS} hourly rechecks. Not downloaded â€” please check the Traffic Report page manually.` });
     vlog(`NOT READY after ${FK_VIEWS_MAX_RECHECKS} rechecks â€” giving up`);
     await new Promise(res => chrome.storage.local.remove(['fk_views_recheck_count'], res));
@@ -2562,6 +2412,283 @@ async function handleFkViewsDownload(job) {
   chrome.runtime.sendMessage({ type: 'JOB_DONE', jobId: job.id });
 }
 
+
+// ── FK_RETURNS — Phase 1: Submit request only (phase 2 = fk_returns_download) ─
+//
+// Navigates to All Returns → sets Date of Closure = yesterday →
+// clicks Request Download → stores requestedAt in chrome.storage → returns immediately.
+// Phase 2 (handleFkReturnsDownload) runs near end of sync to download the ready report.
+
+async function handleFkReturnsRequest(job) {
+  const rlog = txt => chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id, text: `FkReturns: ${txt}` });
+  const yesterday = yesterdayISO();
+
+  // 1. Navigate to All Returns
+  await dismissFkPopups();
+  window.postMessage({ __rumeeNavigateHash: '#dashboard/returnsV2' }, '*');
+  await sleep(4000);
+
+  let allTab = null;
+  const tabDeadline = Date.now() + 8000;
+  while (!allTab && Date.now() < tabDeadline) {
+    allTab = Array.from(document.querySelectorAll('button, [role="tab"], a, span, div'))
+      .filter(el => el.offsetParent)
+      .find(el => el.textContent.trim() === 'All Returns') || null;
+    if (!allTab) await sleep(1000);
+  }
+  // Fallback: re-post the hash nav and give it a second, longer window — both
+  // recorded real-world failures of this check coincided with FK being broadly
+  // slow that run (other unrelated jobs failed the same run too), so a single
+  // retry after re-navigating is worth it before giving up.
+  if (!allTab) {
+    await rlog('"All Returns" tab not found after 8s — retrying nav once');
+    window.postMessage({ __rumeeNavigateHash: '#dashboard/returnsV2' }, '*');
+    await sleep(5000);
+    const retryDeadline = Date.now() + 12000;
+    while (!allTab && Date.now() < retryDeadline) {
+      allTab = Array.from(document.querySelectorAll('button, [role="tab"], a, span, div'))
+        .filter(el => el.offsetParent)
+        .find(el => el.textContent.trim() === 'All Returns') || null;
+      if (!allTab) await sleep(1000);
+    }
+  }
+  if (!allTab) throw new Error('FkReturns: "All Returns" tab not found');
+  allTab.click();
+  await sleep(3500);
+
+  // 2. Open Date of Closure calendar
+  let dateFilterEl = null;
+  const filterDeadline = Date.now() + 10000;
+  while (!dateFilterEl && Date.now() < filterDeadline) {
+    dateFilterEl = Array.from(document.querySelectorAll('button, div, span, [role="button"]'))
+      .filter(el => el.offsetParent)
+      .find(el => el.textContent.trim() === 'Date of Closure') || null;
+    if (!dateFilterEl) await sleep(1000);
+  }
+  if (!dateFilterEl) throw new Error('FkReturns: "Date of Closure" filter not found');
+  dateFilterEl.click();
+  await sleep(1500);
+
+  // 3. Navigate calendar to yesterday, pick day, click Apply
+  const _RET_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+  function _retGetPanels() {
+    return Array.from(document.querySelectorAll('[class*="CalendarMonth"]'))
+      .filter(el => el.querySelectorAll('td').length >= 28);
+  }
+
+  function _retPanelMonth(panel) {
+    const hdr = Array.from(panel.querySelectorAll('*'))
+      .find(el => { const r = el.getBoundingClientRect(); return r.width > 0 && /^[A-Z][a-z]{2} \d{4}$/.test(el.textContent.trim()); });
+    if (!hdr) return null;
+    const [mName, yStr2] = hdr.textContent.trim().split(' ');
+    return { year: parseInt(yStr2, 10), month: _RET_MONTHS.indexOf(mName) + 1 };
+  }
+
+  async function _retGoToMonth(tYear, tMonth) {
+    for (let step = 0; step < 14; step++) {
+      const panels = _retGetPanels();
+      if (!panels.length) throw new Error('FkReturns: No calendar panels found');
+      for (const p of panels) {
+        const m = _retPanelMonth(p);
+        if (m && m.year === tYear && m.month === tMonth) return p;
+      }
+      const firstM = _retPanelMonth(panels[0]);
+      if (!firstM) throw new Error('FkReturns: Cannot read calendar month header');
+      const goNext = (tYear * 12 + tMonth) > (firstM.year * 12 + firstM.month);
+      const navBtn = Array.from(document.querySelectorAll('button'))
+        .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.width < 60; })
+        .find(el => {
+          const cls = (el.className || '') + (el.getAttribute('aria-label') || '');
+          return goNext
+            ? (cls.toLowerCase().includes('next') || cls.toLowerCase().includes('right') || cls.toLowerCase().includes('forward'))
+            : (cls.toLowerCase().includes('prev') || cls.toLowerCase().includes('left')  || cls.toLowerCase().includes('back'));
+        });
+      if (!navBtn) throw new Error(`FkReturns: Calendar ${goNext ? 'next' : 'prev'} button not found`);
+      navBtn.click();
+      await sleep(700);
+    }
+    throw new Error(`FkReturns: Could not navigate calendar to ${tYear}-${tMonth}`);
+  }
+
+  const [yStr, mStr, dStr] = yesterday.split('-');
+  const tYear  = parseInt(yStr, 10);
+  const tMonth = parseInt(mStr, 10);
+  const dayNum = parseInt(dStr, 10);
+
+  rlog(`Navigating calendar to ${tYear}-${tMonth}...`);
+  const calPanel = await _retGoToMonth(tYear, tMonth);
+  const dayCells = Array.from(calPanel.querySelectorAll('td'))
+    .filter(el => el.textContent.trim() === String(dayNum));
+  if (!dayCells.length) throw new Error(`FkReturns: Day ${dayNum} not found in calendar`);
+  dayCells[0].click();
+  await sleep(800);
+
+  const applyBtn = Array.from(document.querySelectorAll('button, [role="button"]'))
+    .filter(el => el.offsetParent)
+    .find(el => el.textContent.trim() === 'Apply');
+  if (!applyBtn) throw new Error('FkReturns: "Apply" button not found after date selection');
+  applyBtn.click();
+  await sleep(2000);
+
+  // 4. Click Request Download — store timestamp, return immediately (no wait)
+  rlog(`Requesting download for ${yesterday}...`);
+  const reqDlBtn = Array.from(document.querySelectorAll('button, [role="button"]'))
+    .find(el => el.offsetParent && el.textContent.includes('Request Download'));
+  if (!reqDlBtn) throw new Error('FkReturns: "Request Download" button not found');
+
+  const STORAGE_KEY = `fk_returns_reqtime_${yesterday}`;
+  const submitResult = await new Promise(resolve => {
+    const handler = e => {
+      if (!e.data?.__rumeeSubmitReport) return;
+      window.removeEventListener('message', handler);
+      clearTimeout(timer);
+      resolve(e.data);
+    };
+    const timer = setTimeout(() => { window.removeEventListener('message', handler); resolve(null); }, 10000);
+    window.addEventListener('message', handler);
+    reqDlBtn.click();
+  });
+
+  const httpStatus = submitResult ? submitResult.status : 0;
+
+  if (httpStatus >= 200 && httpStatus < 300) {
+    await new Promise(res => chrome.storage.local.set({ [STORAGE_KEY]: Date.now() }, res));
+    rlog(`Request accepted (HTTP ${httpStatus}) -- fk_returns_download will pick up later`);
+  } else if (httpStatus >= 400) {
+    await sleep(1500);
+    const bannerEl = Array.from(document.querySelectorAll('*'))
+      .filter(el => el.offsetParent && el.children.length < 5)
+      .find(el => el.textContent.includes('already been requested'));
+    const bannerText = bannerEl ? bannerEl.textContent.trim() : '';
+    rlog(`Red banner: "${bannerText.slice(0, 120)}"`);
+    const isoMatch = bannerText.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})/);
+    if (!isoMatch) throw new Error(`FkReturns: duplicate but could not parse timestamp from banner -- "${bannerText.slice(0, 100)}"`);
+    const bannerTime = new Date(isoMatch[1]).getTime();
+    await new Promise(res => chrome.storage.local.set({ [STORAGE_KEY]: bannerTime }, res));
+    rlog(`Parsed requestedAt from banner: ${new Date(bannerTime).toLocaleTimeString()}`);
+  } else {
+    await new Promise(res => chrome.storage.local.set({ [STORAGE_KEY]: Date.now() }, res));
+    rlog(`No submitReport event (status=${httpStatus}) -- stored timestamp, fk_returns_download will pick up`);
+  }
+
+  chrome.runtime.sendMessage({ type: 'JOB_DONE', jobId: job.id });
+}
+
+
+// ── FK_RETURNS_DOWNLOAD — Phase 2: Poll Previous Downloads and upload ──────────
+//
+// Runs near end of sync (after fk_views, before fk_keywords).
+// By this point phase 1 submitted the request ~30-60 min ago — report should be Ready.
+// Reads requestedAt from chrome.storage, navigates to All Returns page (full reload),
+// opens Previous Downloads panel, finds matching row, fetches and uploads.
+
+async function handleFkReturnsDownload(job) {
+  const rlog = txt => chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id, text: `FkReturnsDownload: ${txt}` });
+  const yesterday = yesterdayISO();
+  const STORAGE_KEY = `fk_returns_reqtime_${yesterday}`;
+
+  const stored = await new Promise(res => chrome.storage.local.get(STORAGE_KEY, res));
+  const requestedAt = stored[STORAGE_KEY];
+  if (!requestedAt) throw new Error(`FkReturnsDownload: no stored requestedAt for ${yesterday} -- did fk_returns phase 1 run?`);
+  rlog(`requestedAt=${new Date(requestedAt).toLocaleTimeString()}, navigating to All Returns...`);
+
+  // Navigate away and back to force full page state refresh
+  window.postMessage({ __rumeeNavigateHash: '#dashboard' }, '*');
+  await sleep(2000);
+  window.postMessage({ __rumeeNavigateHash: '#dashboard/returnsV2?tab=all_returns&state=all' }, '*');
+  await sleep(4000);
+
+  const _retPanelBtn = () => Array.from(document.querySelectorAll('button, [role="button"]'))
+    .find(el => el.textContent.includes('Previous Downloads'));
+  if (!document.documentElement.innerHTML.includes('Requested On')) {
+    const btn = _retPanelBtn();
+    if (!btn) throw new Error('FkReturnsDownload: "Previous Downloads" button not found');
+    btn.click();
+    await sleep(1500);
+  }
+
+  // Find row matching requestedAt within 5 min
+  const _RET_MON = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+  const _retParseTime = text => {
+    const m = text.match(/(\d{1,2}):(\d{2}),\s*(\w+)\s+(\d{1,2}),\s*(\d{4})/);
+    if (!m) return null;
+    const mo = _RET_MON[m[3]];
+    return mo !== undefined ? new Date(+m[5], mo, +m[4], +m[1], +m[2]).getTime() : null;
+  };
+
+  const timeRe = /\d{1,2}:\d{2},\s*\w+\s+\d{1,2},\s*\d{4}/;
+  const candidates = Array.from(document.querySelectorAll('tr, [role="row"], div, li'))
+    .filter(el => timeRe.test(el.textContent) && el.textContent.includes('Ready to download'))
+    .sort((a, b) => a.textContent.length - b.textContent.length);
+
+  let bestRow = null, bestDiff = Infinity;
+  for (const el of candidates) {
+    const t = _retParseTime(el.textContent);
+    if (t === null) continue;
+    const diff = Math.abs(t - requestedAt);
+    if (diff < bestDiff) { bestDiff = diff; bestRow = el; }
+  }
+  const row = (bestDiff <= 5 * 60 * 1000) ? bestRow : null;
+  if (!row) {
+    const FK_RETURNS_MAX_RECHECKS = 3;
+    const { fk_returns_recheck_count = 0 } = await getStorage(['fk_returns_recheck_count']);
+    if (fk_returns_recheck_count >= FK_RETURNS_MAX_RECHECKS) {
+      rlog(`MANUAL_REQUIRED: report not Ready after ${FK_RETURNS_MAX_RECHECKS} rechecks`);
+      chrome.runtime.sendMessage({ type: 'NOTIFY_USER',
+        title: 'Rumee -- Manual Action Required',
+        message: 'FK Returns report not ready after 3 hourly rechecks. Please download from All Returns > Previous Downloads manually.' });
+      await new Promise(res => chrome.storage.local.remove(['fk_returns_recheck_count'], res));
+    } else {
+      const nextCount = fk_returns_recheck_count + 1;
+      await new Promise(res => chrome.storage.local.set({ fk_returns_recheck_count: nextCount }, res));
+      chrome.runtime.sendMessage({ type: 'SCHEDULE_FK_RETURNS_RECHECK', delayMinutes: 60 });
+      rlog(`Report still Pending -- scheduled recheck ${nextCount}/${FK_RETURNS_MAX_RECHECKS} in 60 min`);
+      chrome.runtime.sendMessage({ type: 'NOTIFY_USER',
+        title: `Rumee -- FK Returns Still Generating (${nextCount}/${FK_RETURNS_MAX_RECHECKS})`,
+        message: 'FK Returns report still generating. Will recheck in 1 hour.' });
+    }
+    chrome.runtime.sendMessage({ type: 'JOB_DONE', jobId: job.id });
+    return;
+  }
+
+  // Intercept Download button click and upload
+  const dlEl = Array.from(row.querySelectorAll('*'))
+    .find(el => el.textContent.trim() === 'Download' && !el.children.length);
+  if (!dlEl) throw new Error('FkReturnsDownload: "Download" element not found in ready row');
+
+  rlog('READY -- intercepting download...');
+  await new Promise(res => chrome.runtime.sendMessage({ type: 'RELAY_ARM', jobId: job.id }, res));
+  await sleep(80);
+  dlEl.click();
+  const relayed = await pollStorageForRelay(TIMEOUT_MS);
+  _currentJob = job;
+  if (!relayed) {
+    chrome.runtime.sendMessage({ type: 'RELAY_DISARM' });
+    throw new Error('FkReturnsDownload: no relayed download URL within timeout');
+  }
+  const captured = { url: relayed.url, headers: {} };
+
+  const datedFilename = makeDatedFilename(job, yesterday, yesterday);
+  const resp = await fetch(captured.url, { credentials: 'include', headers: captured.headers || {} });
+  if (!resp.ok) throw new Error(`FkReturnsDownload: fetch failed ${resp.status}`);
+  const buffer = await resp.arrayBuffer();
+  const bytes  = new Uint8Array(buffer);
+  let binary = ''; const CHUNK = 8192;
+  for (let i = 0; i < bytes.length; i += CHUNK)
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+
+  rlog(`Downloaded ${bytes.length} bytes -- uploading as ${datedFilename}`);
+  await new Promise(res => chrome.storage.local.remove([STORAGE_KEY], res));
+  chrome.runtime.sendMessage({
+    type: 'UPLOAD_DATA', jobId: job.id, data: btoa(binary), encoding: 'base64',
+    filename: datedFilename, folderKey: job.folderKey, mimeType: job.mimeType,
+  });
+}
+
+
+
+
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // â”€â”€ FK_KEYWORDS â€” Direct API (no navigation needed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -2572,15 +2699,55 @@ async function handleFkViewsDownload(job) {
 // â”€â”€ FK_RC_DOWNLOAD â€” Poll & download fk_orders, fk_returns, fk_payments â”€â”€â”€â”€â”€â”€â”€â”€
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //
-// This job runs LAST. By this point all 3 requests were submitted at the
-// beginning of the sync (~30-60 min ago) so reports should be Generated.
+// This job runs LAST. By this point fk_orders and fk_payments requests were
+// submitted at the beginning of the sync (~30-60 min ago) so reports should be Generated.
+// fk_returns is not in FK_RC_JOBS — it uses a two-phase direct download (handleFkReturnsRequest + handleFkReturnsDownload).
 //
 // If any are still generating:
 //   â†’ Notify user + schedule 1-hour recheck alarm (up to 3 times)
 //   â†’ After 3 failed rechecks: notify user to download manually
 
-const FK_RC_JOBS = ['fk_orders', 'fk_returns', 'fk_payments'];
+const FK_RC_JOBS = ['fk_orders', 'fk_payments'];
 const FK_RC_MAX_RECHECKS = 3;
+
+// â”€â”€ Gap catch-up: check any order submitted on a previous day that's now due
+// to become ready. Purely additive â€” runs BEFORE the existing loop below,
+// which continues to handle today's date exactly as it always has. No-op
+// unless catch-up is enabled for a given job (see gcIsEnabledFor).
+async function gcCheckFkRCPending() {
+  const { gapCatchupPending = {} } = await getStorage(['gapCatchupPending']);
+  let pending = gapCatchupPending;
+  const today = todayISO();
+
+  for (const jobId of FK_RC_JOBS) {
+    if (!(await gcIsEnabledFor(jobId))) continue;
+    const item = gcGetOldestPending(pending, jobId);
+    if (!item || !item.placed) continue; // nothing submitted-but-not-ready for this job
+
+    const pJob = JOBS.find(j => j.id === jobId);
+    const pCfg = REPORTS_CENTRE_CFG[jobId];
+    const { btn } = findReportRowDownloadBtn(pCfg.subType, item.date, jobId);
+
+    if (btn) {
+      chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
+        text: `GapCatchup: ${item.date} is ready â€” downloading` });
+      const filename = makeDatedFilename(pJob, item.date, item.date);
+      await _downloadFkReport(pJob, btn, filename, false); // silent upload, no queue change
+      const r = gcRecordOutcome(pending, jobId, item.date, today, true);
+      pending = r.pendingItems;
+    } else {
+      const r = gcRecordOutcome(pending, jobId, item.date, today, false);
+      pending = r.pendingItems;
+      if (r.escalated) {
+        chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId, date: r.escalated.date, daysPending: r.escalated.daysPending });
+      } else {
+        chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
+          text: `GapCatchup: ${item.date} still not ready (day ${r.pendingItems[jobId]?.[0]?.daysPending || '?'})` });
+      }
+    }
+  }
+  await new Promise(res => chrome.storage.local.set({ gapCatchupPending: pending }, res));
+}
 
 async function handleFkRCDownload(job) {
   await dismissFkPopups();
@@ -2590,6 +2757,9 @@ async function handleFkRCDownload(job) {
 
   await ensureOnReportsCentre(true);  // already navigates to Requested tab
   await sleep(2000);
+
+  // â”€â”€ Gap catch-up: pick up any previously-submitted, now-ready reports first â”€
+  await gcCheckFkRCPending();
 
   const downloaded = [];
   const pending = [];
@@ -2630,13 +2800,43 @@ async function handleFkRCDownload(job) {
   const pendingNames = pending.map(p => p.jobId.replace('fk_', '').toUpperCase()).join(', ');
 
   if (fk_rc_recheck_count >= FK_RC_MAX_RECHECKS) {
-    // 3 rechecks done â€” notify for manual download
-    chrome.runtime.sendMessage({ type: 'NOTIFY_USER',
-      title: 'âš ï¸ Rumee â€” Manual Action Required',
-      message: `FK Reports (${pendingNames}) not auto-generated after 3 hourly rechecks.\n\nPlease download from Flipkart Reports Centre and place files in the Drive folders manually.`
-    });
-    chrome.runtime.sendMessage({ type:'LOG_DEBUG', jobId: job.id,
-      text: `MANUAL_REQUIRED: ${pendingNames} â€” 3 rechecks exhausted` });
+    // 3 hourly rechecks exhausted for today. Split: gap-catchup-enabled jobs
+    // hand off to cross-day tracking (will keep retrying on later daily runs,
+    // see gcCheckFkRCPending, before finally escalating to manual after
+    // GAP_CATCHUP_MAX_DAYS). Everything else keeps the original behavior —
+    // notify manual immediately, exactly as before this feature existed.
+    const gcPendingJobs = [];
+    const legacyPendingJobs = [];
+    for (const p of pending) {
+      if (await gcIsEnabledFor(p.jobId)) gcPendingJobs.push(p); else legacyPendingJobs.push(p);
+    }
+
+    if (gcPendingJobs.length) {
+      const { gapCatchupPending = {} } = await getStorage(['gapCatchupPending']);
+      let gcState = gapCatchupPending;
+      const today = todayISO();
+      for (const p of gcPendingJobs) {
+        const r = gcRecordOutcome(gcState, p.jobId, yesterday, today, false);
+        gcState = gcMarkPlaced(r.pendingItems, p.jobId, yesterday); // submitted OK, just not ready
+        if (r.escalated) {
+          chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: p.jobId, date: r.escalated.date, daysPending: r.escalated.daysPending });
+        }
+      }
+      await new Promise(res => chrome.storage.local.set({ gapCatchupPending: gcState }, res));
+      chrome.runtime.sendMessage({ type:'LOG_DEBUG', jobId: job.id,
+        text: `GapCatchup: ${gcPendingJobs.map(p=>p.jobId).join(', ')} for ${yesterday} handed off to cross-day tracking (3 hourly rechecks exhausted)` });
+    }
+
+    if (legacyPendingJobs.length) {
+      const legacyNames = legacyPendingJobs.map(p => p.jobId.replace('fk_', '').toUpperCase()).join(', ');
+      chrome.runtime.sendMessage({ type: 'NOTIFY_USER',
+        title: 'Rumee â€” Manual Action Required',
+        message: `FK Reports (${legacyNames}) not auto-generated after 3 hourly rechecks.\n\nPlease download from Flipkart Reports Centre and place files in the Drive folders manually.`
+      });
+      chrome.runtime.sendMessage({ type:'LOG_DEBUG', jobId: job.id,
+        text: `MANUAL_REQUIRED: ${legacyNames} â€” 3 rechecks exhausted` });
+    }
+
     await new Promise(res => chrome.storage.local.remove(['fk_rc_recheck_count'], res));
     chrome.runtime.sendMessage({ type: 'JOB_DONE', jobId: job.id });
     return;
@@ -2671,8 +2871,8 @@ async function handleFkKeywords(job) {
   if (!isReady()) {
     chrome.runtime.sendMessage({
       type: 'NOTIFY_USER',
-      title: 'âš ï¸ Rumee â€” Action Required',
-      message: 'Please navigate to: Flipkart â†’ Growth â†’ Seller Insights â†’ Traffic Report\n1. Click "Latest" (top-right period selector)\n2. Click "All" (product type filter)\n\nScraping will start automatically once you\'re on the right page.',
+      title: 'Rumee - Action Required',
+      message: 'Please navigate to: Flipkart > Growth > Seller Insights > Traffic Report\n1. Click "Latest" (top-right period selector)\n2. Click "All" (product type filter)\n\nScraping will start automatically once you\'re on the right page.',
     });
     console.log('[Rumee/FK] Keywords: waiting for user to navigate to Traffic Report + Latest + All');
 
@@ -2864,18 +3064,18 @@ async function handleFkClaims(job) {
     throw new Error('FK_CLAIMS: "Done" button not found after selecting custom date range');
   }
 
-  // Use content-script fetch (background re-fetch fails for Flipkart CDN CORS)
-  _handlingDownloadInContentScript = true;
-  const capturePromise = interceptNextDownload(TIMEOUT_MS);
+  // RELAY_ARM: content script still does the fetch itself (background re-fetch
+  // fails CORS for this Flipkart CDN endpoint), just fed a reliable URL.
+  await new Promise(res => chrome.runtime.sendMessage({ type: 'RELAY_ARM', jobId: job.id }, res));
   await clickAndWait(doneBtn, 300);
 
-  let captured;
-  try {
-    captured = await capturePromise;
-  } finally {
-    _handlingDownloadInContentScript = false;
-    _currentJob = job;
+  const relayed = await pollStorageForRelay(TIMEOUT_MS);
+  _currentJob = job;
+  if (!relayed) {
+    chrome.runtime.sendMessage({ type: 'RELAY_DISARM' });
+    throw new Error('FK_CLAIMS: no relayed download URL within timeout');
   }
+  const captured = { url: relayed.url, headers: {} };
 
   const claimsFilename = makeDatedFilename(job, fromDate, toDate);
   console.log(`[Rumee/FK] Claims: fetching as ${claimsFilename}`);
@@ -2962,108 +3162,119 @@ async function navigateToClaimsViaHelp() {
 // Flow: My Listings â†’ Downloads button â†’ Download Listing File â†’ wait for
 // "Generating X%" â†’ poll until complete â†’ click download â†“ â†’ intercept URL.
 
+// ── Phase 1: trigger generation and move on immediately ──────────────────────
 async function handleFkListings(job) {
-  await sleep(6000); // My Listings is slow to hydrate
+  const rlog = txt => chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id, text: `FkListings: ${txt}` });
+  await sleep(6000);
   await dismissFkPopups();
-  console.log('[Rumee/FK] Listings: starting');
 
-  // â”€â”€ Navigate to My Listings if direct URL failed (hash nav + fallback) â”€â”€â”€â”€â”€â”€
   const onListings = () => document.body.innerText.includes('Downloads')
     || document.body.innerText.includes('My Listings')
     || (document.body.innerText.includes('Active') && document.body.innerText.includes('Listing'));
 
   if (!onListings()) {
     await waitForSpaBootstrap();
-    console.log('[Rumee/FK] Listings: hash nav â†’ #dashboard/listings-management');
     window.location.hash = '#dashboard/listings-management';
     await sleep(5000);
-
     if (!onListings()) {
-      console.log('[Rumee/FK] Listings: hash nav not confirmed â€” trying sidebar clicks');
-      try {
-        await navigateViaFkSidebar('Listings');
-      } catch (e) {
-        console.warn(`[Rumee/FK] Listings sidebar fallback: ${e.message}`);
-        debugPage('listings-nav-failed');
-      }
+      try { await navigateViaFkSidebar('Listings'); } catch (e) { debugPage('listings-nav-failed'); }
       await sleep(3000);
     }
   }
 
-  // â”€â”€ Confirm "All" filter is active (Flipkart + Shopsy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  const allFilterBtn = findEl(['All'], '[role="tab"], button[class*="filter" i], li[class*="filter" i]');
-  if (allFilterBtn && !allFilterBtn.classList.contains('active') && !allFilterBtn.getAttribute('aria-selected')) {
+  const allFilterBtn = findEl(['All'], '[role=”tab”], button[class*=”filter” i], li[class*=”filter” i]');
+  if (allFilterBtn && !allFilterBtn.classList.contains('active') && !allFilterBtn.getAttribute('aria-selected'))
     await clickAndWait(allFilterBtn, 1000);
-    console.log('[Rumee/FK] Listings: ensured "All" filter is active');
-  }
 
-  // â”€â”€ Wait for actual listings page content to load (not just sidebar) â”€â”€â”€â”€â”€â”€â”€â”€
-  // onListings() can return true from sidebar nav text before page content loads.
-  // Wait up to 20s for a "Downloads" button to appear in the page content.
   let downloadsBtn = null;
   for (let w = 0; w < 10; w++) {
     await sleep(2000);
-    downloadsBtn = Array.from(document.querySelectorAll('button, [role="button"], a'))
+    downloadsBtn = Array.from(document.querySelectorAll('button, [role=”button”], a'))
       .find(el => el.offsetParent && /^downloads?$/i.test(el.textContent.trim()));
-    if (downloadsBtn) {
-      console.log('[Rumee/FK] Listings: found Downloads button');
-      break;
-    }
-    // Fallback: any button with download text (not nav items)
-    downloadsBtn = Array.from(document.querySelectorAll('button, [role="button"]'))
-      .find(el => el.offsetParent && /download/i.test(el.textContent.trim()) &&
-        el.textContent.trim().length < 30);
+    if (downloadsBtn) break;
+    downloadsBtn = Array.from(document.querySelectorAll('button, [role=”button”]'))
+      .find(el => el.offsetParent && /download/i.test(el.textContent.trim()) && el.textContent.trim().length < 30 && !/listing/i.test(el.textContent));
     if (downloadsBtn) break;
   }
   if (!downloadsBtn) {
-    // Log what buttons ARE visible for debugging
-    const allBtns = Array.from(document.querySelectorAll('button, [role="button"], a'))
+    const allBtns = Array.from(document.querySelectorAll('button, [role=”button”], a'))
       .filter(el => el.offsetParent).map(el => el.textContent.trim().slice(0, 30)).join(' | ');
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: 'fk_listings',
-      text: `No Downloads btn after 20s. Visible: ${allBtns.slice(0, 200)}` });
-    throw new Error('FK_LISTINGS: "Downloads" button not found after 20s');
+    rlog(`No Downloads btn after 20s. Visible: ${allBtns.slice(0, 200)}`);
+    throw new Error('FK_LISTINGS: “Downloads” button not found after 20s');
   }
   await clickAndWait(downloadsBtn, 1000);
-  console.log('[Rumee/FK] Listings: opened Downloads dropdown');
 
-  // â”€â”€ Open Downloads History via "View Recent Downloads" â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Try this first â€” it shows existing files immediately without waiting.
-  await sleep(600);
-  const viewRecentOpt = Array.from(document.querySelectorAll('*'))
-    .find(el => el.offsetParent && /view recent downloads/i.test(el.textContent.trim()) &&
+  const dlListingOpt = Array.from(document.querySelectorAll('*'))
+    .find(el => el.offsetParent && /download listing file/i.test(el.textContent.trim()) &&
       el.textContent.trim().length < 30);
+  const dropItems = Array.from(document.querySelectorAll('*'))
+    .filter(el => el.offsetParent && /download|listing|recent/i.test(el.textContent.trim()) && el.textContent.trim().length < 50)
+    .map(el => `[${el.tagName}]${el.textContent.trim().slice(0,30)}`).join(' | ');
+  rlog(`Dropdown items: ${dropItems.slice(0, 200)}`);
+  if (!dlListingOpt) throw new Error('FK_LISTINGS: “Download Listing File” option not found in dropdown');
+  await clickAndWait(dlListingOpt, 2000);
+  rlog('Generation triggered -- fk_listings_download will pick up later');
 
-  if (viewRecentOpt) {
-    await clickAndWait(viewRecentOpt, 2000);
-    console.log('[Rumee/FK] Listings: opened Downloads History via View Recent Downloads');
-  } else {
-    // Fall back to "Download Listing File" which generates a new one
-    const dlListingOpt = Array.from(document.querySelectorAll('*'))
-      .find(el => el.offsetParent && /download listing file/i.test(el.textContent.trim()) &&
-        el.textContent.trim().length < 30);
-    const dropItems = Array.from(document.querySelectorAll('*'))
-      .filter(el => el.offsetParent && /download|listing|recent/i.test(el.textContent.trim()) &&
-        el.textContent.trim().length < 50)
-      .map(el => `[${el.tagName}]${el.textContent.trim().slice(0,30)}`).join(' | ');
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: 'fk_listings',
-      text: `Dropdown: viewRecent=${!!viewRecentOpt} dlListing=${!!dlListingOpt} items: ${dropItems.slice(0,200)}` });
-    if (!dlListingOpt) throw new Error('FK_LISTINGS: dropdown options not found');
-    await clickAndWait(dlListingOpt, 2000);
-    console.log('[Rumee/FK] Listings: requested new file generation');
+  await new Promise(res => chrome.storage.local.set({ fk_listings_gen_date: todayISO() }, res));
+  chrome.runtime.sendMessage({ type: 'JOB_DONE', jobId: job.id });
+}
+
+// ── Phase 2: check if ready, download; else schedule recheck ─────────────────
+async function handleFkListingsDownload(job) {
+  const rlog = txt => chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id, text: `FkListingsDownload: ${txt}` });
+  const FK_LISTINGS_MAX_RECHECKS = 3;
+
+  const { fk_listings_gen_date } = await getStorage(['fk_listings_gen_date']);
+  if (fk_listings_gen_date !== todayISO()) {
+    rlog(`No generation triggered today (stored=${fk_listings_gen_date}) -- skipping`);
+    chrome.runtime.sendMessage({ type: 'JOB_DONE', jobId: job.id });
+    return;
   }
 
-  // â”€â”€ Poll up to 3 min for a ready Listing file in the Downloads History â”€â”€â”€â”€
-  const pollDeadline = Date.now() + 3 * 60 * 1000;
-  let fileBtn = null;
+  // Navigate to listings page
+  const onListings = () => document.body.innerText.includes('Downloads History')
+    || document.body.innerText.includes('My Listings')
+    || (document.body.innerText.includes('Active') && document.body.innerText.includes('Listing'));
 
+  await dismissFkPopups();
+  await sleep(4000);
+  if (!onListings()) {
+    await waitForSpaBootstrap();
+    window.location.hash = '#dashboard/listings-management';
+    await sleep(5000);
+    if (!onListings()) {
+      try { await navigateViaFkSidebar('Listings'); } catch (e) { /* ignore */ }
+      await sleep(3000);
+    }
+  }
+
+  // Open Downloads → View Recent Downloads
+  let downloadsBtn = null;
+  for (let w = 0; w < 10; w++) {
+    await sleep(2000);
+    downloadsBtn = Array.from(document.querySelectorAll('button, [role=”button”], a'))
+      .find(el => el.offsetParent && /^downloads?$/i.test(el.textContent.trim()));
+    if (downloadsBtn) break;
+    downloadsBtn = Array.from(document.querySelectorAll('button, [role=”button”]'))
+      .find(el => el.offsetParent && /download/i.test(el.textContent.trim()) && el.textContent.trim().length < 30 && !/listing/i.test(el.textContent));
+    if (downloadsBtn) break;
+  }
+  if (!downloadsBtn) throw new Error('FkListingsDownload: Downloads button not found');
+  await clickAndWait(downloadsBtn, 800);
+
+  const viewRecent = Array.from(document.querySelectorAll('*'))
+    .find(el => el.offsetParent && /view recent downloads/i.test(el.textContent.trim()) && el.textContent.trim().length < 30);
+  if (viewRecent) await clickAndWait(viewRecent, 2000);
+
+  // Poll up to 2 min for the file to become ready
+  const pollDeadline = Date.now() + 2 * 60 * 1000;
+  let fileBtn = null;
   while (Date.now() < pollDeadline) {
     fileBtn = findReadyListingDownloadBtn();
-    if (fileBtn) { console.log('[Rumee/FK] Listings: file ready'); break; }
+    if (fileBtn) { rlog('File ready -- downloading'); break; }
     const panelOpen = document.body.innerText.includes('Downloads History');
-    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: 'fk_listings',
-      text: `Poll: panelOpen=${panelOpen} bodySnippet="${document.body.innerText.slice(0,150)}"` });
+    rlog(`Poll: panelOpen=${panelOpen}`);
     await sleep(5000);
-    // Reopen panel if closed
     if (!panelOpen) {
       await clickAndWait(downloadsBtn, 800);
       await sleep(500);
@@ -3073,27 +3284,49 @@ async function handleFkListings(job) {
     }
   }
 
-  if (!fileBtn) throw new Error('FK_LISTINGS: file generation did not complete within 3 min');
+  if (!fileBtn) {
+    const { fk_listings_recheck_count = 0 } = await getStorage(['fk_listings_recheck_count']);
+    if (fk_listings_recheck_count >= FK_LISTINGS_MAX_RECHECKS) {
+      rlog(`MANUAL_REQUIRED: still Generating after ${FK_LISTINGS_MAX_RECHECKS} rechecks`);
+      chrome.runtime.sendMessage({ type: 'NOTIFY_USER',
+        title: 'Rumee -- Manual Action Required',
+        message: 'FK Listings file not ready after 3 rechecks. Download manually from All Listings > Downloads.' });
+      await new Promise(res => chrome.storage.local.remove(['fk_listings_recheck_count', 'fk_listings_gen_date'], res));
+    } else {
+      const nextCount = fk_listings_recheck_count + 1;
+      await new Promise(res => chrome.storage.local.set({ fk_listings_recheck_count: nextCount }, res));
+      chrome.runtime.sendMessage({ type: 'SCHEDULE_FK_LISTINGS_RECHECK', delayMinutes: 60 });
+      rlog(`Still Generating -- scheduled recheck ${nextCount}/${FK_LISTINGS_MAX_RECHECKS} in 60 min`);
+      chrome.runtime.sendMessage({ type: 'NOTIFY_USER',
+        title: `Rumee -- FK Listings Still Generating (${nextCount}/${FK_LISTINGS_MAX_RECHECKS})`,
+        message: 'FK Listings file still generating. Will recheck in 1 hour.' });
+    }
+    chrome.runtime.sendMessage({ type: 'JOB_DONE', jobId: job.id });
+    return;
+  }
 
-  // â”€â”€ Download via content-script fetch (CORS bypass, same as fk_orders) â”€â”€â”€â”€
-  console.log('[Rumee/FK] Listings: downloading file');
-  _handlingDownloadInContentScript = true;
-  const capturePromise = interceptNextDownload(TIMEOUT_MS);
+  // Download the ready file
+  await new Promise(res => chrome.runtime.sendMessage({ type: 'RELAY_ARM', jobId: job.id }, res));
   await clickAndWait(fileBtn, 300);
-  let captured;
-  try { captured = await capturePromise; }
-  finally { _handlingDownloadInContentScript = false; _currentJob = job; }
+  const relayed = await pollStorageForRelay(TIMEOUT_MS);
+  _currentJob = job;
+  if (!relayed) {
+    chrome.runtime.sendMessage({ type: 'RELAY_DISARM' });
+    throw new Error('FkListingsDownload: no relayed download URL within timeout');
+  }
+  const captured = { url: relayed.url, headers: {} };
 
   const resp = await fetch(captured.url, { credentials: 'include', headers: captured.headers || {} });
-  if (!resp.ok) throw new Error(`FK_LISTINGS: fetch failed ${resp.status}`);
+  if (!resp.ok) throw new Error(`FkListingsDownload: fetch failed ${resp.status}`);
   const buffer = await resp.arrayBuffer();
   const bytes = new Uint8Array(buffer);
   let binary = ''; const CHUNK = 8192;
   for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-  const today = todayISO();
+  await new Promise(res => chrome.storage.local.remove(['fk_listings_gen_date', 'fk_listings_recheck_count'], res));
+  rlog(`Downloaded ${bytes.length} bytes -- uploading as flipkart_listings_${todayISO()}.xls`);
   chrome.runtime.sendMessage({
     type: 'UPLOAD_DATA', jobId: job.id, data: btoa(binary), encoding: 'base64',
-    filename: `flipkart_listings_${today}.xls`, folderKey: job.folderKey, mimeType: job.mimeType,
+    filename: `flipkart_listings_${todayISO()}.xls`, folderKey: job.folderKey, mimeType: job.mimeType,
   });
 }
 
@@ -3175,7 +3408,7 @@ async function fillDateRange(fromISO, toISO) {
     setValue(fi, fromISO);
     await sleep(300);
     setValue(ti, toISO);
-    console.log(`[Rumee/FK] fillDateRange (type=date): ${fromISO} â†’ ${toISO}`);
+    console.log(`[Rumee/FK] fillDateRange (type=date): ${fromISO} â†' ${toISO}`);
     return;
   }
 
@@ -3191,7 +3424,7 @@ async function fillDateRange(fromISO, toISO) {
     setValue(fi, ddmmyyyy(fromISO));
     await sleep(300);
     setValue(ti, ddmmyyyy(toISO));
-    console.log(`[Rumee/FK] fillDateRange (DD/MM/YYYY text): ${fromISO} â†’ ${toISO}`);
+    console.log(`[Rumee/FK] fillDateRange (DD/MM/YYYY text): ${fromISO} â†' ${toISO}`);
     return;
   }
 
@@ -3234,11 +3467,11 @@ async function fillDateRange(fromISO, toISO) {
   await sleep(400);
   const toOk = await clickCalDate(toISO);
   if (fromOk || toOk) {
-    console.log(`[Rumee/FK] fillDateRange (calendar click): ${fromISO} â†’ ${toISO} (from=${fromOk} to=${toOk})`);
+    console.log(`[Rumee/FK] fillDateRange (calendar click): ${fromISO} â†' ${toISO} (from=${fromOk} to=${toOk})`);
     return;
   }
 
-  console.warn(`[Rumee/FK] fillDateRange: no strategy worked â€” ${fromISO}â†’${toISO} NOT set`);
+  console.warn(`[Rumee/FK] fillDateRange: no strategy worked â€” ${fromISO}â†'${toISO} NOT set`);
 }
 
 /** Set an input value and fire React/Angular change events. */
@@ -3352,7 +3585,7 @@ window.addEventListener('message', (event) => {
   window.__rumeeCapturingBlob = false;
 
   const { base64, mimeType, size } = event.data;
-  console.log(`[Rumee/FK] âœ“ blob relay: ${size} bytes â†’ ${capturedJob.id}`);
+  console.log(`[Rumee/FK] âœ“ blob relay: ${size} bytes â†' ${capturedJob.id}`);
 
   chrome.runtime.sendMessage({
     type:      'UPLOAD_DATA',

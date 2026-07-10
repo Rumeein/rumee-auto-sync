@@ -45,12 +45,12 @@
     },
     {
       "matches": ["https://supplier.meesho.com/*"],
-      "js": ["config.js", "content/meesho.js"],
+      "js": ["ist-time.js", "gap-catchup.js", "config.js", "content/meesho.js"],
       "run_at": "document_idle"
     },
     {
       "matches": ["https://seller.flipkart.com/*"],
-      "js": ["config.js", "content/flipkart.js"],
+      "js": ["ist-time.js", "gap-catchup.js", "config.js", "content/flipkart.js"],
       "run_at": "document_idle"
     }
   ],
@@ -64,7 +64,7 @@
 
   "web_accessible_resources": [
     {
-      "resources": ["log.html", "logger.js", "secrets.js", "config.js"],
+      "resources": ["log.html", "logger.js", "secrets.js", "config.js", "ist-time.js", "gap-catchup.js"],
       "matches":   ["<all_urls>"]
     }
   ],

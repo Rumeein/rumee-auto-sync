@@ -121,6 +121,34 @@ function loadStatus() {
     updateButtons(data);
     updateScheduleInput(data);
   });
+  renderGapCatchupManual();
+}
+
+// ── Gap catch-up: items that gave up after GAP_CATCHUP_MAX_DAYS and need a
+// manual download + a click to clear them. See gap-catchup.js.
+function renderGapCatchupManual() {
+  chrome.storage.local.get('gapCatchupManual', ({ gapCatchupManual = [] }) => {
+    const section = document.getElementById('gapCatchupSection');
+    const list = document.getElementById('gapCatchupList');
+    if (!gapCatchupManual.length) {
+      section.classList.add('hidden');
+      list.innerHTML = '';
+      return;
+    }
+    section.classList.remove('hidden');
+    list.innerHTML = gapCatchupManual.map((item, i) => `
+      <div class="job-row" style="justify-content:space-between">
+        <span>${item.jobId} — ${item.date}</span>
+        <button class="btn btn--secondary" data-gc-index="${i}" style="padding:2px 10px;font-size:11px">Mark Done</button>
+      </div>
+    `).join('');
+    list.querySelectorAll('[data-gc-index]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const item = gapCatchupManual[Number(btn.dataset.gcIndex)];
+        chrome.runtime.sendMessage({ type: 'MARK_GAP_CATCHUP_DONE', jobId: item.jobId, date: item.date }, () => renderGapCatchupManual());
+      });
+    });
+  });
 }
 
 function updateBanner(data) {
@@ -260,6 +288,11 @@ function attachListeners() {
   // Stop sync
   document.getElementById('stopBtn').addEventListener('click', () => {
     chrome.runtime.sendMessage({ type: 'STOP_SYNC' }, () => loadStatus());
+  });
+
+  // Open backfill hub
+  document.getElementById('backfillBtn').addEventListener('click', () => {
+    chrome.tabs.create({ url: chrome.runtime.getURL('backfill-hub.html') });
   });
 
   // Save schedule
