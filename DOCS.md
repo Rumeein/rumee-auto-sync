@@ -31,6 +31,7 @@
 21. [Chrome Web Store Publishing (Future Reference)](#21-chrome-web-store-publishing-future-reference)
 22. [Glossary](#22-glossary)
 23. [Flipkart UI Internals & Timing Behavior](#23-flipkart-ui-internals--timing-behavior)
+24. [Gap Self-Healing (Retry-on-Failure) System](#24-gap-self-healing-retry-on-failure-system)
 
 ---
 
@@ -1534,6 +1535,8 @@ On each fresh install:
 - Folder IDs are saved locally to that Chrome profile
 - Unrelated to any other install or profile
 
+**Also per-install (added 2026-07-10):** `MEESHO_SUPPLIER_SLUG` in `config.js` — the short ID that appears in every `supplier.meesho.com` panel URL for this specific Meesho seller account. Most of the extension detects this dynamically from the live page URL, but a few spots (opening a brand-new tab before any Meesho page has loaded, and the standalone backfill tools) need a known-good value up front. Change this one constant for a different Meesho account — same pattern as the Drive folder IDs above, this is the only thing that should ever need editing for a second business, never something hardcoded inside the job logic itself.
+
 If you need to see or reset the saved folder IDs:
 1. `chrome://extensions` → click "Details" on the extension → "Extension options" (or developer tools)
 2. Or open the extension's background page → Console → `chrome.storage.local.get('customFolders', console.log)`
@@ -1769,18 +1772,62 @@ When logs show repeated "rejecting this header — N month labels", this is expe
 
 ---
 
-### Multiple Concurrent Sync Runs (Missed-Day Alarms)
+### Missed-Day Alarms — CORRECTED 2026-07-10 (previous version of this section was wrong)
 
-When the extension misses its daily alarm for several days (e.g., Chrome was closed), multiple "missed day" alarms fire at startup — one for each missed day. This causes several sync runs to execute in parallel or rapid succession, one for each date.
+**This section previously claimed** that missing the daily alarm for several days causes one "missed day" alarm to fire per missed day, each syncing its own date independently. **That was never true — there is no such mechanism in the code.** `chrome.alarms` fires the single daily alarm at most once when Chrome next starts; there is no per-missed-day replay. Confirmed by direct investigation 2026-07-10 (see the Rumee Auto-Sync project's own memory item 17): the actual historical gaps this caused (FK Orders/ME Views missing for many May–June dates) were traced to exactly this — the daily alarm firing once and only targeting "yesterday" at whatever moment it happened to fire, silently skipping any days in between.
 
-**Each sync run is independent:**
-- Each uploads files with their respective date in the filename
-- Drive's upsert logic prevents duplicates (file with same name is updated, not duplicated)
-- Each run updates `lastRun[jobId]` only for its own date
+**What the extension actually does when it misses a day:** every job normally computes its target date as plain "yesterday" at run time, with no memory of the last successful date. If Chrome was off when the alarm should have fired, and it later fires (once), it targets "yesterday relative to that later moment" — any days strictly in between are never targeted by anything and are permanently lost, unless recovered manually via a backfill tool (`me-orders-backfill.html`, `me-payments-backfill.html`, `test-returns.html`, `backfill-hub.html`).
 
-**This is expected and harmless.** The data is correct; only the logs are hard to read because multiple runs interleave their output.
+**Section 24 (below) is the fix for a *related but distinct* problem** — not the missed-alarm case above, but a job that *did* run and *did* start, but failed partway through (order placed but never became ready, or a single-shot download that errored). That class of failure now retries automatically for a few days before asking for manual help. It does not and cannot help with the "alarm never fired at all" case described in this section — there's nothing to retry if nothing was ever attempted.
 
 ---
 
-*Document version: 1.2 — Sections 19–20 added 2026-06-13: multi-account use + Chrome Web Store publishing reference. Section 13 updated: auto folder creation setup flow.*  
-*Companion files: `recording.md` (UI navigation details), `config.js` (all job and folder definitions)*
+## 24. Gap Self-Healing (Retry-on-Failure) System
+
+**Added 2026-07-10.** Closes the class of gap where a job *ran and started* but didn't finish — an order got placed on Flipkart's Reports Centre but never became ready, or a single-shot download failed partway through. Previously this either needed a manual notice-and-backfill, or (worse) went unnoticed until a Dashboard-side audit found the missing file weeks later. It does **not** help the "the daily alarm never fired at all" case — see the corrected note under Section 23 for that distinction.
+
+### Core files
+
+| File | Purpose |
+|---|---|
+| `gap-catchup.js` | Pure decision logic — no `chrome.*` calls, no DOM. Tracks stuck dates per job, decides when to retry vs. escalate. Testable standalone in Node. |
+| `gap-catchup.test.js` | 21 simulated scenarios covering every code path (normal day, retry succeeds, retry fails repeatedly, escalation, two dates stuck at once, same-day idempotency). Run with `node gap-catchup.test.js` — no live Flipkart/Meesho needed, no waiting real days. |
+
+### The two mechanisms
+
+**Two-phase jobs (`fk_orders`, `fk_payments`)** — these submit a request to Flipkart's Reports Centre, then a separate later step (`fk_rc_download`) polls for it to become ready:
+- If placing the order itself fails, it's retried on the next run (alongside that day's normal new order).
+- If placed but not ready after the existing same-day hourly-recheck budget (3 rechecks, ~3 hours) is exhausted, instead of asking for manual help immediately, it hands off to cross-day tracking and keeps checking on later daily runs.
+- Still not ready after **3 days total** → escalates to manual (see below).
+- Implementation: `gcAttemptFkPlacementCatchup` and `gcCheckFkRCPending` in `content/flipkart.js`, both purely additive to the existing `_handleFkReportsCentreInner` / `handleFkRCDownload` functions.
+
+**Single-shot jobs** (`me_payments`, `me_orders`, `me_ads`, and all 7 FK ads report types) — no submit/wait split, just "did this attempt succeed or fail":
+- A failed attempt is retried for that *same missed date* on the next run, before doing today's normal job.
+- Still failing after **3 days** → escalates to manual.
+- The date to target (`gcSingleShotTargetDate` in `content/meesho.js`, `_fkAdsCurrentTargetDate` in `content/flipkart.js`) is always a *data* date, never a *run* date — a failure on day X's run always means day X-1's data is what's owed, not day X. See the comment block at the top of `gap-catchup.js` for the full explanation with a worked example.
+- FK ads specifically: `background.js`'s `getEffectiveStartUrl` decides the target date and bakes it into the tab's navigation URL (`?duration=...`); the content script reads that date back out of `window.location.hash` instead of independently recomputing it, so every part of one job run — the date picker, the filename, the campaign cache — agrees on the same date, including during a retry. This replaced an earlier design where 5 separate spots each called `yesterdayISO()` independently, which would have silently disagreed during a retry.
+- Outcome recording is centralized once in `background.js`'s `markJobResult` (via `recordSingleShotGapCatchup` + the `SINGLE_SHOT_GC_JOBS` allowlist), not duplicated per job handler.
+
+### Explicitly excluded — and why
+
+| Job | Reason |
+|---|---|
+| `fk_returns` (download phase) | Flipkart's own Returns panel doesn't show which date a pending request is for, only an approximate timestamp — matching by timestamp already caused 5 of 13 dates to silently fail during a manual June backfill. Automated retry risks matching the wrong date with high confidence, which is worse than an honest failure. Instead: on failure, it goes straight to the manual-escalation path below, immediately, with no retry attempt. |
+| `me_returns`, `me_claims` | Their Meesho exports aren't date-parameterized at all — Returns exports "whatever's currently in the Delivered tab," Claims exports a rolling 30/180-day window. There's no specific date to retry. |
+| `fk_views` | Already had its own separate fix (a persisted watermark that walks a date *range* forward) — different design, predates this system, not part of it. |
+| `fk_listings`, `fk_claims`, `me_catalog`, `fk_keywords` | Snapshot-style jobs (current state, not a specific day's data) — same reasoning as the exclusions above. |
+
+### Manual escalation
+
+When a job gives up (3 days of retrying, or the immediate fk_returns case): a Discord message posts to the `#auto-sync` webhook, a Chrome desktop notification fires, and the item appears in the extension popup under "⚠ Manual Action Needed" with a "Mark Done" button. Click it once you've downloaded the file by hand and placed it in the right Drive folder — that's the only thing that clears the item from the list.
+
+### Kill switch — staged rollout, instant rollback
+
+Everything above is gated by `chrome.storage.local.gapCatchupEnabled` (bool, default `false`) plus `gapCatchupJobs` (array of job IDs currently opted in, default empty). With the switch off, or a job not in the array, every new code path is a proven no-op — verified both by code review and live testing. To roll back if anything ever looks wrong: clear or shrink `gapCatchupJobs`. No code revert, no extension reinstall, takes effect on the next run.
+
+As of 2026-07-10, all candidate jobs are live: `fk_orders`, `fk_payments`, `me_payments`, `me_orders`, `me_ads`, and all 7 FK ads report types (`fk_ads_daily`, `fk_ads_fsn`, `fk_ads_placements`, `fk_ads_overall`, `fk_ads_search`, `fk_ads_orders`, `fk_ads_kw`) — each individually confirmed via a real `RUN_NOW` trigger, not just simulation.
+
+---
+
+*Document version: 1.3 — Section 24 added 2026-07-10: gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. (v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
+*Companion files: `recording.md` (UI navigation details), `config.js` (all job and folder definitions), `gap-catchup.js` / `gap-catchup.test.js` (retry-on-failure system)*
