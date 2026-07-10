@@ -1909,11 +1909,12 @@ async function verifyAndLogManifest() {
 }
 
 // ─── Manifest history rebuild — one-time (or as-needed) repair tool ───────────
-// download_manifest.csv rows written before commit 65c597e used the old
-// syncStarted-timing check and are largely wrong (see verifyAndLogManifest's
-// comment above). This rebuilds the ENTIRE file from scratch for [fromDate,
-// toDate] using the same content-based truth as the now-fixed live check, so
-// history matches what the fixed code would have written all along.
+// download_manifest.csv rows written before this content-based redesign used
+// the old syncStarted-timing check and are largely wrong (see
+// _checkManifestSlotForDate's comment above). This rebuilds the ENTIRE file
+// from scratch for [fromDate, toDate] using the same content-based truth as
+// the now-fixed live check, so history matches what the fixed code would have
+// written all along.
 //
 // Uses the same match rule as _checkManifestSlotForDate (filename-date for
 // single/multi, per-row date column for append) but fetches each folder's full
