@@ -499,6 +499,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Manual trigger to rebuild download_manifest.csv history for a date range
+  // (repair tool — see rebuildManifestHistory). msg.fromDate/toDate: 'YYYY-MM-DD'.
+  if (msg.type === 'REBUILD_MANIFEST_HISTORY') {
+    rebuildManifestHistory(msg.fromDate, msg.toDate, !!msg.dryRun)
+      .then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
   // Content script debug log — writes directly to rumeeLog (for DOM inspection).
   // All writes are chained through _logQueue to prevent concurrent storage overwrites.
   // IMPORTANT: The chain must NEVER reject — a rejected _logQueue causes all subsequent
@@ -1767,65 +1775,60 @@ const MANIFEST_SLOTS = [
   { folderKey: 'FK_KEYWORDS', kind: 'single', label: 'flipkart_keywords' },
 ];
 
+// Does a slot have real data for one specific date? Checked by CONTENT, never
+// by upload timing — this is the single source of truth shared by the live
+// daily verify (below) and the manual history rebuild (rebuildManifestHistory).
+//
+// - single/multi slots (20 of 22) always upload with the exact data date
+//   embedded in the filename (e.g. flipkart_orders_2026-07-10.xlsx) — matched
+//   via a Drive filename query.
+// - append slots (2: meesho_views.csv, meesho_ads_master.csv) are a single
+//   rolling file with no date in the name — content is appended/upserted in
+//   place — so they're matched by their own per-row date column instead
+//   (`Date` / `Last Updated`) via a substring check on the downloaded file.
+//
+// ORIGINAL BUG (fixed here): this used to check "was anything uploaded to this
+// folder since syncStarted". verifyAndLogManifest() scans ALL 22 slots every
+// time it runs, and it's called again after every recheck mini-sync
+// (fk_rc_recheck, fk_views_recheck, fk_returns_recheck, fk_listings_recheck) —
+// each of which overwrites `syncStarted` to its OWN recent start time. A
+// recheck firing hours after the main sync would then find every OTHER job's
+// already-uploaded file "stale" against that narrow new cutoff and wrongly
+// flip its correct Verified row back to Missing. Confirmed via
+// rumee_sync_log.csv: e.g. 2026-06-17 "21 verified, 2 missing" immediately
+// followed 6 min later by a recheck logging "0 verified, 23 missing" for the
+// same data date. Checking by content instead of timing removes the whole bug
+// class instead of narrowing the timing window (a first attempt anchored to
+// IST midnight still broke on a post-midnight call — verified live).
+async function _checkManifestSlotForDate(token, slot, dataDate) {
+  const folderId = DRIVE_FOLDERS[slot.folderKey];
+  if (!folderId) return [];
+
+  if (slot.kind === 'append') {
+    const existing = await searchDriveFile(token, folderId, slot.label);
+    if (!existing) return [];
+    const text = await downloadDriveFileText(token, existing.id);
+    const hasDate = text.split('\n').some(l => l.includes(dataDate));
+    return hasDate ? [{ name: slot.label }] : [];
+  }
+
+  const nameQ = encodeURIComponent(
+    `'${folderId}' in parents and trashed=false and name contains '${dataDate}'`
+  );
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${nameQ}&fields=files(name)&pageSize=100`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (res.status === 401) { await invalidateDriveToken(); throw new Error('Drive token expired'); }
+  if (!res.ok) throw new Error(`manifest list failed (${res.status}) for folder ${folderId}`);
+  return (await res.json()).files || [];
+}
+
 async function verifyAndLogManifest() {
   const token = await getDriveToken(true);
 
   const runDate  = todayStr();
   const dataDate = yesterdayISOBg();
-
-  // Single/multi-kind slots (20 of 22) always upload with the exact data date
-  // embedded in the filename (e.g. flipkart_orders_2026-07-10.xlsx) — verified
-  // by checking every folder directly. So for those, match on that filename
-  // instead of upload recency: it checks WHAT was captured, not WHEN this
-  // function happened to run relative to it. This also fixes the original bug
-  // (below) at the root instead of narrowing the timing window.
-  const filesForDate = async (folderId) => {
-    const nameQ = encodeURIComponent(
-      `'${folderId}' in parents and trashed=false and name contains '${dataDate}'`
-    );
-    const res = await fetch(
-      `https://www.googleapis.com/drive/v3/files?q=${nameQ}&fields=files(name,modifiedTime)&pageSize=100`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (res.status === 401) { await invalidateDriveToken(); throw new Error('Drive token expired'); }
-    if (!res.ok) throw new Error(`manifest list failed (${res.status}) for folder ${folderId}`);
-    return (await res.json()).files || [];
-  };
-
-  // The 2 append-kind slots (meesho_views.csv, meesho_ads_master.csv) are a
-  // single rolling file with no date in the name — content is appended/upserted
-  // in place, so they can only be checked by modifiedTime. Window is anchored to
-  // the START of dataDate's own IST day, a full day before the earliest a sync
-  // for this dataDate could plausibly run, so it stays correct regardless of
-  // exactly when this function is called relative to that sync.
-  //
-  // ORIGINAL BUG (fixed here): this used to anchor to `syncStarted` from
-  // chrome.storage.local. This function scans ALL 22 slots every time it runs,
-  // and it's called again after every recheck mini-sync (fk_rc_recheck,
-  // fk_views_recheck, fk_returns_recheck, fk_listings_recheck) — each of which
-  // overwrites `syncStarted` to its OWN recent start time. A recheck firing
-  // hours after the main sync would then find every OTHER job's already-uploaded
-  // file "stale" against that narrow new cutoff and wrongly flip its correct
-  // Verified row back to Missing. Confirmed via rumee_sync_log.csv: e.g.
-  // 2026-06-17 "21 verified, 2 missing" immediately followed 6 min later by a
-  // recheck logging "0 verified, 23 missing" for the same data date — and
-  // reproduced live in this session testing an istToday()-anchored fix, which
-  // broke the same way when called after IST midnight relative to the sync.
-  const cutoffMs = Date.parse(`${dataDate}T00:00:00Z`) - IST_OFFSET_MS;
-  const cutoffIso = new Date(cutoffMs).toISOString();
-
-  const freshFiles = async (folderId) => {
-    const q = encodeURIComponent(
-      `'${folderId}' in parents and trashed=false and modifiedTime > '${cutoffIso}'`
-    );
-    const res = await fetch(
-      `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(name,modifiedTime)&pageSize=100&orderBy=modifiedTime desc`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (res.status === 401) { await invalidateDriveToken(); throw new Error('Drive token expired'); }
-    if (!res.ok) throw new Error(`manifest list failed (${res.status}) for folder ${folderId}`);
-    return (await res.json()).files || [];
-  };
 
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
 
@@ -1836,10 +1839,9 @@ async function verifyAndLogManifest() {
   let verified = 0, missing = 0;
 
   for (const slot of MANIFEST_SLOTS) {
-    const folderId = DRIVE_FOLDERS[slot.folderKey];
-    if (!folderId) continue;
+    if (!DRIVE_FOLDERS[slot.folderKey]) continue;
     let fresh = [];
-    try { fresh = slot.kind === 'append' ? await freshFiles(folderId) : await filesForDate(folderId); }
+    try { fresh = await _checkManifestSlotForDate(token, slot, dataDate); }
     catch (e) { logError('verify', `${slot.label}: list error ${e.message}`); }
 
     if (slot.kind === 'multi') {
@@ -1904,4 +1906,88 @@ async function verifyAndLogManifest() {
   }
 
   return { verified, missing };
+}
+
+// ─── Manifest history rebuild — one-time (or as-needed) repair tool ───────────
+// download_manifest.csv rows written before commit 65c597e used the old
+// syncStarted-timing check and are largely wrong (see verifyAndLogManifest's
+// comment above). This rebuilds the ENTIRE file from scratch for [fromDate,
+// toDate] using the same content-based truth as the now-fixed live check, so
+// history matches what the fixed code would have written all along.
+//
+// Uses the same match rule as _checkManifestSlotForDate (filename-date for
+// single/multi, per-row date column for append) but fetches each folder's full
+// file listing / each rolling file's content ONCE up front, then matches every
+// date against that in memory — turns what would be (slots × days) Drive calls
+// into ~23 total, regardless of how many days are being rebuilt.
+async function rebuildManifestHistory(fromDate, toDate, dryRun = false) {
+  const token = await getDriveToken(true);
+
+  const folderListings = {};   // folderKey -> [{name}]
+  const appendContent  = {};   // folderKey -> file text ('' if no file yet)
+
+  for (const slot of MANIFEST_SLOTS) {
+    const folderId = DRIVE_FOLDERS[slot.folderKey];
+    if (!folderId || folderListings[slot.folderKey] || appendContent[slot.folderKey] !== undefined) continue;
+
+    if (slot.kind === 'append') {
+      const existing = await searchDriveFile(token, folderId, slot.label);
+      appendContent[slot.folderKey] = existing ? await downloadDriveFileText(token, existing.id) : '';
+      continue;
+    }
+
+    const listQ = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${listQ}&fields=files(name)&pageSize=1000`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (res.status === 401) { await invalidateDriveToken(); throw new Error('Drive token expired'); }
+    if (!res.ok) throw new Error(`rebuild list failed (${res.status}) for ${slot.folderKey}`);
+    folderListings[slot.folderKey] = (await res.json()).files || [];
+  }
+
+  const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const header = 'Run Date,Data Date,File Name,Status';
+  const rows = [];
+
+  for (let d = fromDate; d <= toDate; d = istAddDays(d, 1)) {
+    const runDate = istAddDays(d, 1);   // sync for date d runs the evening of d+1
+    for (const slot of MANIFEST_SLOTS) {
+      if (!DRIVE_FOLDERS[slot.folderKey]) continue;
+
+      if (slot.kind === 'append') {
+        const has = (appendContent[slot.folderKey] || '').split('\n').some(l => l.includes(d));
+        rows.push([runDate, d, slot.label, has ? 'Verified' : 'Missing']);
+        continue;
+      }
+
+      const matches = (folderListings[slot.folderKey] || []).filter(f => f.name.includes(d));
+      if (slot.kind === 'multi') {
+        if (matches.length) for (const f of matches) rows.push([runDate, d, f.name, 'Verified']);
+        else rows.push([runDate, d, slot.label, 'Missing']);
+      } else {
+        rows.push([runDate, d, slot.label, matches.length ? 'Verified' : 'Missing']);
+      }
+    }
+  }
+
+  const content = [header, ...rows.map(r => r.map(q).join(','))].join('\n');
+
+  // dryRun: compute everything, write nothing — lets the result be inspected
+  // (e.g. specific slot/date rows) before trusting a real overwrite of the
+  // production manifest file.
+  if (dryRun) {
+    logSuccess('verify', `Manifest history DRY RUN: ${rows.length} rows, ${fromDate} → ${toDate} (not written)`);
+    return { rows: rows.length, from: fromDate, to: toDate, dryRun: true, sample: rows };
+  }
+
+  const buffer = new TextEncoder().encode(content).buffer;
+  const folderId = DRIVE_FOLDERS.DOWNLOAD_MANIFEST;
+  const filename = 'download_manifest.csv';
+  const existing = await searchDriveFile(token, folderId, filename);
+  if (existing) await updateDriveFile(token, existing.id, buffer, 'text/csv');
+  else          await uploadToDrive(buffer, filename, folderId, 'text/csv');
+
+  logSuccess('verify', `Manifest history rebuilt: ${rows.length} rows, ${fromDate} → ${toDate}`);
+  return { rows: rows.length, from: fromDate, to: toDate };
 }

@@ -1868,8 +1868,12 @@ window.addEventListener('message', async (event) => {
     return;
   }
 
-  // All other types (RUN_NOW, STOP_SYNC, UPDATE_SCHEDULE…) forward to background
-  chrome.runtime.sendMessage(msg);
+  // All other types (RUN_NOW, STOP_SYNC, VERIFY_NOW, REBUILD_MANIFEST_HISTORY…)
+  // forward to background; relay any response back so MCP tools can read
+  // sendResponse() return values, not just fire-and-forget.
+  chrome.runtime.sendMessage(msg, response => {
+    window.postMessage({ __rumeeMsgResponse: true, type: msg.type, response }, '*');
+  });
 });
 
 } // end double-injection guard

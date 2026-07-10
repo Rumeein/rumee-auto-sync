@@ -32,6 +32,7 @@
 22. [Glossary](#22-glossary)
 23. [Flipkart UI Internals & Timing Behavior](#23-flipkart-ui-internals--timing-behavior)
 24. [Gap Self-Healing (Retry-on-Failure) System](#24-gap-self-healing-retry-on-failure-system)
+25. [Download Manifest — File-Level Verification](#25-download-manifest--file-level-verification)
 
 ---
 
@@ -1436,6 +1437,10 @@ The extension uploads files using the `filename` from each job's config.js defin
 | FK_KEYWORDS | Date + SKU + Keyword |
 | All others | Date range per file (no overlap expected) |
 
+### Checking whether a day's files actually arrived
+
+Don't infer this from the extension's own run log — see [Section 25](#25-download-manifest--file-level-verification) for the file built specifically for this (`download_manifest.csv`) and its guarantees.
+
 ---
 
 ## 18. Known Issues & Pending Actions
@@ -1867,5 +1872,61 @@ As of 2026-07-10, all candidate jobs are live: `fk_orders`, `fk_payments`, `me_p
 
 ---
 
-*Document version: 1.3 — Section 24 added 2026-07-10: gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. (v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
+## 25. Download Manifest — File-Level Verification
+
+**Added 2026-07-11.** `download_manifest.csv` (Drive folder: `Rumee Raw Data/Download Manifest`, `DRIVE_FOLDERS.DOWNLOAD_MANIFEST` in config.js) is a standing answer to one question, per job, per day: **"is the real file actually sitting in Drive?"** It exists so a downstream reader (e.g. a dashboard/pipeline) doesn't have to re-derive that by listing 22 Drive folders itself, and doesn't have to trust the extension's own run log — a job can log "success" and still not have a usable file (wrong data captured, upload silently failed, etc).
+
+### Format
+
+4 columns, one row per (data date, file/slot):
+
+| Run Date | Data Date | File Name | Status |
+|---|---|---|---|
+| 2026-07-11 | 2026-07-10 | flipkart_orders | Verified |
+
+- **Run Date** — the calendar day this row was last written (IST). Not the day the data is about.
+- **Data Date** — the day the data covers (IST). **This is the join key** — match a Dashboard record's date against this column, not Run Date.
+- **File Name** — for single/append slots, the stable slot label (e.g. `flipkart_orders`, `meesho_views.csv`) — NOT the literal filename, so a slot can only ever have one row per Data Date, which is what makes it upsert-in-place safely. For multi slots (Meesho Ads summary/catalog — one file per live campaign per day), it's the actual filename, since there can be more than one per date.
+- **Status** — `Verified` (file/content confirmed present for that date) or `Missing` (checked, not found).
+
+One row per (Data Date, File Name) — later writes overwrite the same row in place, they don't append a duplicate.
+
+### The 22 tracked slots
+
+Defined in `MANIFEST_SLOTS` (background.js, just above `verifyAndLogManifest`). Covers every file-producing path across all 25 jobs in `JOBS` (config.js) — request-only/orchestration jobs (`fk_views_request`, `fk_rc_download`, the phase-1 half of `fk_returns`/`fk_listings`) don't get their own slot; their output lands under the slot of whichever job actually uploads the file.
+
+20 of the 22 slots (**single** — one file expected; **multi** — Meesho Ads, one file per live campaign) are verified by checking whether a file with the exact **Data Date** embedded in its filename exists in that slot's Drive folder (e.g. `flipkart_orders_2026-07-10.xlsx`) — every job that isn't a rolling file follows this naming convention.
+
+The remaining 2 (**append**) are single rolling files with no date in the filename — `meesho_views.csv` (rows keep appending) and `meesho_ads_master.csv` (one row per campaign, upserted by ID). These are verified by checking the file's *own content* for a row matching the Data Date (`Date` column for views, `Last Updated` column for ads master) — not by when the file was last touched.
+
+**Important limitation, not a bug:** `meesho_ads_master.csv` only ever shows the row's *current* `Last Updated` value. If a campaign was refreshed daily for two weeks, only the *last* of those days is provable from today's file content — the earlier days' evidence is overwritten in place by the job's own upsert design. A backfill/rebuild of this specific slot will correctly show `Missing` for those earlier days even though the job likely did succeed then. This is an accepted, structural limitation of a "current state" file, not something the manifest can recover.
+
+**Also not detected:** whether a `Verified` file's *content* is actually correct — this checks presence only, not validity (a corrupted-but-present file, e.g. the historical `me_catalog` truncation bug, would show `Verified`). If a downstream reader needs content-integrity guarantees too, that check has to happen on its own side.
+
+### When it runs
+
+`verifyAndLogManifest()` (background.js) is called from `finishSync()`, i.e. every time the job queue empties — that's the main daily sync (~25 jobs) **and** every recheck mini-sync (`fk_rc_recheck`, `fk_views_recheck`, `fk_returns_recheck`, `fk_listings_recheck` — these fire hourly, up to 3× each, whenever a slow FK report is still generating). On a normal day it runs once; on a day with delayed reports it can run 3-4 times, each time re-checking all 22 slots and upserting into the same file.
+
+Can also be triggered manually for testing: `chrome.runtime.sendMessage({type: 'VERIFY_NOW'})`, or via the MCP debug relay (`window.postMessage({__rumee:true, msg:{type:'VERIFY_NOW'}}, '*')` on a live Meesho/Flipkart tab).
+
+### History: known-bad before 2026-07-11, fixed and backfilled since
+
+Every row up to and including 2026-07-10 was written by an older, broken version of this check — one that verified "was anything uploaded in the last few minutes" instead of "does data for this date exist." Since the check re-runs after every recheck mini-sync, and each recheck resets what "the last few minutes" means, a recheck routinely wiped out the correct `Verified` status of ~20 *other*, unrelated jobs, replacing it with a false `Missing`. Confirmed via `rumee_sync_log.csv` (same Data Date logging "21 verified, 2 missing" then "0 verified, 23 missing" 6 minutes later) and by direct comparison against real Drive files (130 of 285 spot-checked rows were false negatives).
+
+**Fixed in commit `65c597e`** (2026-07-11): rewrote the check to be content-based (see "The 22 tracked slots" above) instead of timing-based, which removes the entire class of bug rather than narrowing the timing window. Live-verified against real Google Drive search (not the desktop-synced local mirror, which lags — confirmed separately) both directions: correctly `Missing` for a file that didn't exist yet, correctly `Verified` for one that did.
+
+**History rebuilt same day**: every row from 2026-06-11 through 2026-07-10 was recomputed from real Drive file presence (same logic as the live check) and the whole file was overwritten — not just new rows appended. Rebuilt via `rebuildManifestHistory(fromDate, toDate, dryRun)` (background.js), triggered manually: `{type: 'REBUILD_MANIFEST_HISTORY', fromDate, toDate, dryRun}`. `dryRun: true` computes and returns the result (including a full `sample` row array) without writing — use this to spot-check before a real rebuild. Kept in the codebase as a standing repair tool (not deleted after use) in case a future bug in the matching logic ever needs the same kind of correction again.
+
+**Practical result:** every row in the file, past and present, now reflects the fixed logic. No manual caveat needed when reading history — it's been corrected, not just fixed going forward.
+
+### For Dashboard / other downstream readers
+
+- Join on **Data Date**, not Run Date.
+- A `Missing` row can flip to `Verified` on a later date's row write (upsert in place) — if reading this file on a schedule, a `Missing` seen today isn't necessarily permanent; re-check before treating it as final data loss.
+- Presence ≠ correctness (see limitation above) — this file answers "did the job produce a file," not "is the data in that file right."
+- If Dashboard needs to document its own side of this contract (how it reads/uses this file), that belongs in Dashboard's own `DOCS.md`, with a one-line pointer back to this section — not duplicated here. See Section 20's multi-tenant/cross-project doc rule for why.
+
+---
+
+*Document version: 1.4 — Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. (v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
 *Companion files: `recording.md` (UI navigation details), `config.js` (all job and folder definitions), `gap-catchup.js` / `gap-catchup.test.js` (retry-on-failure system)*
