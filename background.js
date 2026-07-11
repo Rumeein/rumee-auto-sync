@@ -1772,7 +1772,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // the varied filename/date conventions across jobs.
 //   single  — one file expected; Verified if a fresh file exists, else Missing.
 //   multi   — N files expected (ads per live campaign); one row per fresh file,
-//             or a single Missing row if none.
+//             labelled with a numeric suffix (slot.label_1, _2, ...) so rows
+//             stay distinct without leaking campaign ID/date into File Name.
+//             A single Missing row (no suffix) if none.
 //   append  — file is overwritten in place (meesho_views, ads master); Verified
 //             if its modifiedTime is within the run window.
 // Upserts rows into the Download Manifest Sheet (4 cols: Run Date, Data Date, File Name, Status).
@@ -1786,8 +1788,8 @@ const MANIFEST_SLOTS = [
   { folderKey: 'ME_CATALOG',  kind: 'single', label: 'meesho_inventory' },
   { folderKey: 'ME_VIEWS',    kind: 'append', label: 'meesho_views.csv' },
   { folderKey: 'ME_ADS_MASTER',  kind: 'append', label: 'meesho_ads_master.csv' },
-  { folderKey: 'ME_ADS_SUMMARY', kind: 'multi',  label: 'meesho_ads_*_summary' },
-  { folderKey: 'ME_ADS_CATALOG', kind: 'multi',  label: 'meesho_ads_*_catalog' },
+  { folderKey: 'ME_ADS_SUMMARY', kind: 'multi',  label: 'meesho_ads_summary' },
+  { folderKey: 'ME_ADS_CATALOG', kind: 'multi',  label: 'meesho_ads_catalog' },
   // Flipkart
   { folderKey: 'FK_ORDERS',   kind: 'single', label: 'flipkart_orders' },
   { folderKey: 'FK_RETURNS',  kind: 'single', label: 'flipkart_returns' },
@@ -1809,9 +1811,11 @@ const MANIFEST_SLOTS = [
 // by upload timing — this is the single source of truth shared by the live
 // daily verify (below) and the manual history rebuild (rebuildManifestHistory).
 //
-// - single/multi slots (20 of 22) always upload with the exact data date
-//   embedded in the filename (e.g. flipkart_orders_2026-07-10.xlsx) — matched
-//   via a Drive filename query.
+// - single slots (20 of 22) always upload with the exact data date embedded
+//   in the filename (e.g. flipkart_orders_2026-07-10.xlsx) — matched via a
+//   Drive filename query. Ads summary/catalog also carry a per-campaign ID
+//   in their real Drive filename, but the manifest only checks "does at
+//   least one match exist", so that's transparent to this check.
 // - append slots (2: meesho_views.csv, meesho_ads_master.csv) are a single
 //   rolling file with no date in the name — content is appended/upserted in
 //   place — so they're matched by their own per-row date column instead
@@ -1874,7 +1878,11 @@ async function verifyAndLogManifest() {
 
     if (slot.kind === 'multi') {
       if (fresh.length) {
-        for (const f of fresh) { results.push({ fileName: f.name, status: 'Verified' }); verified++; }
+        // Sort by real filename (stable — embeds campaign ID) so the same
+        // campaign always lands on the same _N suffix across reruns, instead
+        // of depending on Drive's list-order (which isn't guaranteed stable).
+        const ordered = fresh.slice().sort((a, b) => a.name.localeCompare(b.name));
+        ordered.forEach((f, i) => { results.push({ fileName: `${slot.label}_${i + 1}`, status: 'Verified' }); verified++; });
       } else {
         results.push({ fileName: slot.label, status: 'Missing' }); missing++;
       }
@@ -1991,8 +1999,12 @@ async function rebuildManifestHistory(fromDate, toDate, dryRun = false) {
 
       const matches = (folderListings[slot.folderKey] || []).filter(f => f.name.includes(d));
       if (slot.kind === 'multi') {
-        if (matches.length) for (const f of matches) rows.push([runDate, d, f.name, 'Verified']);
-        else rows.push([runDate, d, slot.label, 'Missing']);
+        if (matches.length) {
+          // Same stable-sort rule as verifyAndLogManifest — same campaign,
+          // same _N suffix, regardless of Drive's list-order.
+          const ordered = matches.slice().sort((a, b) => a.name.localeCompare(b.name));
+          ordered.forEach((f, i) => rows.push([runDate, d, `${slot.label}_${i + 1}`, 'Verified']));
+        } else rows.push([runDate, d, slot.label, 'Missing']);
       } else {
         rows.push([runDate, d, slot.label, matches.length ? 'Verified' : 'Missing']);
       }
