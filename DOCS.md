@@ -1886,6 +1886,16 @@ No new OAuth consent was needed — confirmed against Google's own Sheets API sc
 
 **For anyone who wants to look at this data by hand:** open it in Drive and use the built-in preview — that's always safe. Do not "Open with Google Sheets" and then manually retype/reformat a date cell (that's the one way a human could still reintroduce the old failure mode); typing/pasting into a cell still triggers Sheets' own auto-type-detection the same way it always has for any spreadsheet.
 
+### Ads summary/catalog File Name cleanup (2026-07-11)
+
+`meesho_ads_summary`/`meesho_ads_catalog` were the only 2 (of 22) slots that wrote the real, literal Drive filename into the sheet's File Name column — e.g. `meesho_ads_22247405_summary_2026-06-11.csv`, campaign ID and date both baked in. That was redundant with the separate Data Date column and inconsistent with every other slot's stable-label row, making the sheet harder to scan.
+
+**Fix:** these 2 slots now write the stable label with a numeric suffix per matched file — `meesho_ads_summary_1`, `meesho_ads_summary_2`, ... for however many live campaigns produced a file that date (no suffix, just the bare label, when Missing). Matched files are sorted by their real filename (stable — embeds campaign ID) before numbering, so the same campaign lands on the same `_N` suffix across reruns/rechecks of the same day — this matters because Jaiswal maintains his own manual formula in a 5th sheet column ("Status Flag") that depends on row-order stability.
+
+**Scope:** `background.js` only (`MANIFEST_SLOTS` labels + the `multi`-kind branches in both `verifyAndLogManifest()` and `rebuildManifestHistory()`). No change to actual Drive uploads, filenames, or any other job — the real per-campaign, per-date files in Drive are untouched and still named exactly as before.
+
+**History rebuilt same day:** full range 2026-06-11 → 2026-07-10 recomputed with the new format, 690 rows (unchanged count), verified via direct Sheet read post-write.
+
 ### Format
 
 4 columns, one row per (data date, file/slot):
@@ -1896,7 +1906,7 @@ No new OAuth consent was needed — confirmed against Google's own Sheets API sc
 
 - **Run Date** — the calendar day this row was last written (IST). Not the day the data is about.
 - **Data Date** — the day the data covers (IST). **This is the join key** — match a Dashboard record's date against this column, not Run Date.
-- **File Name** — for single/append slots, the stable slot label (e.g. `flipkart_orders`, `meesho_views.csv`) — NOT the literal filename, so a slot can only ever have one row per Data Date, which is what makes it upsert-in-place safely. For multi slots (Meesho Ads summary/catalog — one file per live campaign per day), it's the actual filename, since there can be more than one per date.
+- **File Name** — for single/append slots, the stable slot label (e.g. `flipkart_orders`, `meesho_views.csv`) — NOT the literal filename, so a slot can only ever have one row per Data Date, which is what makes it upsert-in-place safely. For multi slots (Meesho Ads summary/catalog — one file per live campaign per day), it's the stable slot label with a numeric suffix per match (`meesho_ads_summary_1`, `_2`, ...) — never the real per-campaign, per-date Drive filename. See "Ads summary/catalog File Name cleanup" below.
 - **Status** — `Verified` (file/content confirmed present for that date) or `Missing` (checked, not found).
 
 One row per (Data Date, File Name) — later writes overwrite the same row in place, they don't append a duplicate.
@@ -1905,7 +1915,7 @@ One row per (Data Date, File Name) — later writes overwrite the same row in pl
 
 Defined in `MANIFEST_SLOTS` (background.js, just above `verifyAndLogManifest`). Covers every file-producing path across all 25 jobs in `JOBS` (config.js) — request-only/orchestration jobs (`fk_views_request`, `fk_rc_download`, the phase-1 half of `fk_returns`/`fk_listings`) don't get their own slot; their output lands under the slot of whichever job actually uploads the file.
 
-20 of the 22 slots (**single** — one file expected; **multi** — Meesho Ads, one file per live campaign) are verified by checking whether a file with the exact **Data Date** embedded in its filename exists in that slot's Drive folder (e.g. `flipkart_orders_2026-07-10.xlsx`) — every job that isn't a rolling file follows this naming convention.
+20 of the 22 slots (**single** — one file expected; **multi** — Meesho Ads, one file per live campaign) are verified by checking whether a file with the exact **Data Date** embedded in its filename exists in that slot's Drive folder (e.g. `flipkart_orders_2026-07-10.xlsx`) — every job that isn't a rolling file follows this naming convention. This detection logic is unchanged for multi slots — only what gets *written to the Sheet* for a match differs (see below).
 
 The remaining 2 (**append**) are single rolling files with no date in the filename — `meesho_views.csv` (rows keep appending) and `meesho_ads_master.csv` (one row per campaign, upserted by ID). These are verified by checking the file's *own content* for a row matching the Data Date (`Date` column for views, `Last Updated` column for ads master) — not by when the file was last touched.
 
@@ -1935,11 +1945,12 @@ Every row up to and including 2026-07-10 was written by an older, broken version
 
 - **This is now a Google Sheet, not a CSV file** (`spreadsheetId` = `DOWNLOAD_MANIFEST_SHEET_ID` in config.js, inside `DRIVE_FOLDERS.DOWNLOAD_MANIFEST`). Two ways to read it: (a) Sheets API `values.get` on range `A:D`, or (b) Drive API `files.export` on the spreadsheet with `mimeType=text/csv` — this returns the same 4 columns as plain CSV bytes without needing the Sheets API at all, if that's a smaller change on Dashboard's side.
 - Join on **Data Date**, not Run Date.
+- For ads summary/catalog rows, match File Name on the `meesho_ads_summary`/`meesho_ads_catalog` prefix (optionally followed by `_N`) — do not expect a per-campaign-ID or per-date filename in this column, see "Ads summary/catalog File Name cleanup" above.
 - A `Missing` row can flip to `Verified` on a later date's row write (upsert in place) — if reading this file on a schedule, a `Missing` seen today isn't necessarily permanent; re-check before treating it as final data loss.
 - Presence ≠ correctness (see limitation above) — this file answers "did the job produce a file," not "is the data in that file right."
 - If Dashboard needs to document its own side of this contract (how it reads/uses this file), that belongs in Dashboard's own `DOCS.md`, with a one-line pointer back to this section — not duplicated here. See Section 20's multi-tenant/cross-project doc rule for why.
 
 ---
 
-*Document version: 1.5 — Section 25 updated 2026-07-11: download_manifest.csv migrated to a native Google Sheet (`drive/sheets.js`, `DOWNLOAD_MANIFEST_SHEET_ID`) after the CSV was found silently reformatted by an external spreadsheet-app open+save; Dashboard read-path note updated. (v1.4: Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
+*Document version: 1.6 — Section 25 updated 2026-07-11: ads summary/catalog File Name column cleaned up (`meesho_ads_summary_1`/`_2` instead of the real per-campaign, per-date filename), full history rebuilt, Dashboard read-path note updated. (v1.5: Section 25 updated 2026-07-11: download_manifest.csv migrated to a native Google Sheet (`drive/sheets.js`, `DOWNLOAD_MANIFEST_SHEET_ID`) after the CSV was found silently reformatted by an external spreadsheet-app open+save; Dashboard read-path note updated. v1.4: Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
 *Companion files: `recording.md` (UI navigation details), `config.js` (all job and folder definitions), `gap-catchup.js` / `gap-catchup.test.js` (retry-on-failure system)*
