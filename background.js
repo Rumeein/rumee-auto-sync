@@ -2,7 +2,7 @@
 // MV3 service worker: sleeps between alarms. ALL state lives in
 // chrome.storage.local so we survive sleep/wake cycles mid-job.
 
-importScripts('ist-time.js', 'gap-catchup.js', 'secrets.js', 'config.js', 'logger.js', 'drive/upload.js');
+importScripts('ist-time.js', 'gap-catchup.js', 'secrets.js', 'config.js', 'logger.js', 'drive/upload.js', 'drive/sheets.js');
 
 const ALARM_NAME     = 'rumee-daily-sync';
 const KEEPALIVE_ALARM = 'rumee_keepalive';   // wakes SW every 2 min → watchdog can fire on time
@@ -499,11 +499,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Manual trigger to rebuild download_manifest.csv history for a date range
-  // (repair tool — see rebuildManifestHistory). msg.fromDate/toDate: 'YYYY-MM-DD'.
+  // Manual trigger to rebuild the Download Manifest Sheet's history for a date
+  // range (repair tool — see rebuildManifestHistory). msg.fromDate/toDate: 'YYYY-MM-DD'.
   if (msg.type === 'REBUILD_MANIFEST_HISTORY') {
     rebuildManifestHistory(msg.fromDate, msg.toDate, !!msg.dryRun)
       .then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
+  // One-time migration step: create the Download Manifest Sheet (see DOCS.md
+  // Section 25). Returns the new spreadsheetId, which must be hand-copied into
+  // config.js as DOWNLOAD_MANIFEST_SHEET_ID before verifyAndLogManifest /
+  // rebuildManifestHistory can write to it.
+  if (msg.type === 'CREATE_MANIFEST_SHEET') {
+    (async () => {
+      const token = await getDriveToken(true);
+      const id = await createSheetInFolder(token, DRIVE_FOLDERS.DOWNLOAD_MANIFEST, 'download_manifest');
+      sendResponse({ sheetId: id });
+    })().catch(e => sendResponse({ error: e.message }));
+    return true;
+  }
+
+  // One-time cleanup: trash the old download_manifest.csv once the Sheet
+  // migration is verified. Moves to Drive Trash, not a permanent delete.
+  if (msg.type === 'DELETE_MANIFEST_CSV') {
+    (async () => {
+      const token = await getDriveToken(true);
+      const existing = await searchDriveFile(token, DRIVE_FOLDERS.DOWNLOAD_MANIFEST, 'download_manifest.csv');
+      if (!existing) { sendResponse({ ok: false, reason: 'not found' }); return; }
+      const res = await fetch(`https://www.googleapis.com/drive/v3/files/${existing.id}`, {
+        method: 'PATCH',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trashed: true }),
+      });
+      sendResponse({ ok: res.ok, status: res.status });
+    })().catch(e => sendResponse({ error: e.message }));
     return true;
   }
 
@@ -1745,7 +1775,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 //             or a single Missing row if none.
 //   append  — file is overwritten in place (meesho_views, ads master); Verified
 //             if its modifiedTime is within the run window.
-// Appends rows to download_manifest.csv (4 cols: Run Date, Data Date, File Name, Status).
+// Upserts rows into the Download Manifest Sheet (4 cols: Run Date, Data Date, File Name, Status).
 
 const MANIFEST_SLOTS = [
   // Meesho
@@ -1830,8 +1860,6 @@ async function verifyAndLogManifest() {
   const runDate  = todayStr();
   const dataDate = yesterdayISOBg();
 
-  const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-
   // Each result → { fileName, status }. Single/append slots use the stable slot
   // LABEL as File Name (so a Missing row flips to Verified in place on recheck);
   // multi (ads) slots use each actual filename (unique per campaign+date).
@@ -1856,31 +1884,28 @@ async function verifyAndLogManifest() {
     }
   }
 
-  // ── Upsert into download_manifest.csv, keyed by (Data Date + File Name) ──────
-  const header = 'Run Date,Data Date,File Name,Status';
-  const folderId = DRIVE_FOLDERS.DOWNLOAD_MANIFEST;
-  const filename = 'download_manifest.csv';
-  const existing = await searchDriveFile(token, folderId, filename);
+  // ── Upsert into the Download Manifest Sheet, keyed by (Data Date + File Name) ─
+  // Native Sheet, not a CSV — writing structured arrays via valueInputOption=RAW
+  // means there's no delimiter/quoting to get wrong and no "open + resave" step
+  // that can silently reformat dates (see DOCS.md Section 25).
+  const sheetId = DOWNLOAD_MANIFEST_SHEET_ID;
+  const existingRows = await sheetsGetValues(token, sheetId, 'A2:D200000'); // skip header row 1
 
-  // key = Data Date + File Name (delimited) so a Missing row updates in place.
+  // key = Data Date + File Name so a Missing row updates in place.
   const byKey = new Map();
-  if (existing) {
-    const prev = await downloadDriveFileText(token, existing.id);
-    const lines = prev.trim().split('\n').map(l => l.trim()).filter(Boolean);
-    for (const l of lines.slice(1)) {          // skip header
-      const f = _parseCsvLine(l);
-      byKey.set(`${f[1]}||${f[2]}`, l);
-    }
+  for (const row of existingRows) {
+    if (!row[1] || !row[2]) continue;
+    byKey.set(`${row[1]}||${row[2]}`, row);
   }
   for (const r of results) {
-    const line = [runDate, dataDate, r.fileName, r.status].map(q).join(',');
-    byKey.set(`${dataDate}||${r.fileName}`, line);  // insert or overwrite in place
+    byKey.set(`${dataDate}||${r.fileName}`, [runDate, dataDate, r.fileName, r.status]);
   }
 
-  const content = [header, ...byKey.values()].join('\n');
-  const buffer = new TextEncoder().encode(content).buffer;
-  if (existing) await updateDriveFile(token, existing.id, buffer, 'text/csv');
-  else          await uploadToDrive(buffer, filename, folderId, 'text/csv');
+  await sheetsClearValues(token, sheetId, 'A:D');
+  await sheetsSetValues(token, sheetId, 'A1', [
+    ['Run Date', 'Data Date', 'File Name', 'Status'],
+    ...byKey.values(),
+  ]);
 
   logSuccess('verify', `Manifest: ${verified} verified, ${missing} missing (data date ${dataDate})`);
 
@@ -1909,9 +1934,12 @@ async function verifyAndLogManifest() {
 }
 
 // ─── Manifest history rebuild — one-time (or as-needed) repair tool ───────────
-// download_manifest.csv rows written before this content-based redesign used
-// the old syncStarted-timing check and are largely wrong (see
-// _checkManifestSlotForDate's comment above). This rebuilds the ENTIRE file
+// Writes to the Download Manifest Sheet (DOWNLOAD_MANIFEST_SHEET_ID, config.js
+// — see DOCS.md Section 25; replaced download_manifest.csv 2026-07-11 because
+// a CSV gets silently reformatted by Excel/Sheets on open+save). Rows written
+// before the content-based redesign (65c597e/4bebb99) used the old
+// syncStarted-timing check and were largely wrong (see
+// _checkManifestSlotForDate's comment above). This rebuilds the ENTIRE sheet
 // from scratch for [fromDate, toDate] using the same content-based truth as
 // the now-fixed live check, so history matches what the fixed code would have
 // written all along.
@@ -1947,8 +1975,7 @@ async function rebuildManifestHistory(fromDate, toDate, dryRun = false) {
     folderListings[slot.folderKey] = (await res.json()).files || [];
   }
 
-  const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const header = 'Run Date,Data Date,File Name,Status';
+  const header = ['Run Date', 'Data Date', 'File Name', 'Status'];
   const rows = [];
 
   for (let d = fromDate; d <= toDate; d = istAddDays(d, 1)) {
@@ -1972,22 +1999,17 @@ async function rebuildManifestHistory(fromDate, toDate, dryRun = false) {
     }
   }
 
-  const content = [header, ...rows.map(r => r.map(q).join(','))].join('\n');
-
   // dryRun: compute everything, write nothing — lets the result be inspected
   // (e.g. specific slot/date rows) before trusting a real overwrite of the
-  // production manifest file.
+  // production manifest Sheet.
   if (dryRun) {
     logSuccess('verify', `Manifest history DRY RUN: ${rows.length} rows, ${fromDate} → ${toDate} (not written)`);
     return { rows: rows.length, from: fromDate, to: toDate, dryRun: true, sample: rows };
   }
 
-  const buffer = new TextEncoder().encode(content).buffer;
-  const folderId = DRIVE_FOLDERS.DOWNLOAD_MANIFEST;
-  const filename = 'download_manifest.csv';
-  const existing = await searchDriveFile(token, folderId, filename);
-  if (existing) await updateDriveFile(token, existing.id, buffer, 'text/csv');
-  else          await uploadToDrive(buffer, filename, folderId, 'text/csv');
+  const sheetId = DOWNLOAD_MANIFEST_SHEET_ID;
+  await sheetsClearValues(token, sheetId, 'A:D');
+  await sheetsSetValues(token, sheetId, 'A1', [header, ...rows]);
 
   logSuccess('verify', `Manifest history rebuilt: ${rows.length} rows, ${fromDate} → ${toDate}`);
   return { rows: rows.length, from: fromDate, to: toDate };

@@ -41,6 +41,15 @@ const DRIVE_FOLDERS = {
   SYNC_LOG:          '1zqHbDZ20589xtFEaF921zX0ILoKhy8zO',  // Rumee Sync Logs/rumee_sync_log.csv
 };
 
+// ── Download Manifest Sheet ───────────────────────────────────────────────────
+// Native Google Sheet that replaced download_manifest.csv (see DOCS.md
+// Section 25) — a CSV gets silently reformatted by Excel/Sheets on open+save;
+// a Sheet does not, since viewing it never rewrites the underlying data.
+// Lives inside DRIVE_FOLDERS.DOWNLOAD_MANIFEST. Created once via the
+// CREATE_MANIFEST_SHEET message handler in background.js; this ID is filled
+// in by hand afterward, same as every other DRIVE_FOLDERS ID above.
+const DOWNLOAD_MANIFEST_SHEET_ID = '13YE-RMTJs60GOvZ0zteA32k3fuWcoeG4S8xaeNgYpqo';
+
 // ── Job definitions ───────────────────────────────────────────────────────────
 // frequency:
 //   'daily'   — run every day

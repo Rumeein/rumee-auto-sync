@@ -1874,7 +1874,17 @@ As of 2026-07-10, all candidate jobs are live: `fk_orders`, `fk_payments`, `me_p
 
 ## 25. Download Manifest — File-Level Verification
 
-**Added 2026-07-11.** `download_manifest.csv` (Drive folder: `Rumee Raw Data/Download Manifest`, `DRIVE_FOLDERS.DOWNLOAD_MANIFEST` in config.js) is a standing answer to one question, per job, per day: **"is the real file actually sitting in Drive?"** It exists so a downstream reader (e.g. a dashboard/pipeline) doesn't have to re-derive that by listing 22 Drive folders itself, and doesn't have to trust the extension's own run log — a job can log "success" and still not have a usable file (wrong data captured, upload silently failed, etc).
+**Added 2026-07-11, migrated from CSV to a native Google Sheet later the same day.** The Download Manifest (Drive folder: `Rumee Raw Data/Download Manifest`, `DRIVE_FOLDERS.DOWNLOAD_MANIFEST` in config.js; the manifest itself is the Sheet at `DOWNLOAD_MANIFEST_SHEET_ID` in config.js) is a standing answer to one question, per job, per day: **"is the real file actually sitting in Drive?"** It exists so a downstream reader (e.g. a dashboard/pipeline) doesn't have to re-derive that by listing 22 Drive folders itself, and doesn't have to trust the extension's own run log — a job can log "success" and still not have a usable file (wrong data captured, upload silently failed, etc).
+
+### CSV → Google Sheet (2026-07-11)
+
+Originally a CSV file (`download_manifest.csv`). Hours after the history rebuild below, the live file was found reformatted — dates flipped from quoted ISO (`"2026-07-10"`) to unquoted, locale-style `07-10-2026`, plus Windows line endings and trailing blank rows. Root-caused with byte-level evidence, not guessed: the extension's own write code (`verifyAndLogManifest`/`rebuildManifestHistory`) always writes quoted ISO dates with Unix line endings — provably incapable of producing what was found on Drive. The fingerprint (CRLF + unquoted + locale date reformat) matches a spreadsheet app (Excel/Sheets) opening and re-saving the CSV, not a code bug — a CSV is plain text with no protection against that.
+
+**Fix: replaced the CSV with a native Google Sheet.** A Sheet stores typed cell values, not a flat text blob — there is no "resave the whole file as text" step for merely opening/viewing it to trigger, so the same failure mode is structurally impossible now. Writes use the Sheets API (`drive/sheets.js`) with `valueInputOption=RAW`, so a written string like `"2026-07-10"` is stored exactly as given — no auto date-type conversion (which `USER_ENTERED` would trigger). Both `verifyAndLogManifest()` and `rebuildManifestHistory()` now always clear the full range before writing the complete data back, so no stale/trailing rows can ever survive a shrink either.
+
+No new OAuth consent was needed — confirmed against Google's own Sheets API scope docs that the existing `drive.file` scope (manifest.json) already covers Sheets API calls for files this app creates.
+
+**For anyone who wants to look at this data by hand:** open it in Drive and use the built-in preview — that's always safe. Do not "Open with Google Sheets" and then manually retype/reformat a date cell (that's the one way a human could still reintroduce the old failure mode); typing/pasting into a cell still triggers Sheets' own auto-type-detection the same way it always has for any spreadsheet.
 
 ### Format
 
@@ -1909,6 +1919,8 @@ The remaining 2 (**append**) are single rolling files with no date in the filena
 
 Can also be triggered manually for testing: `chrome.runtime.sendMessage({type: 'VERIFY_NOW'})`, or via the MCP debug relay (`window.postMessage({__rumee:true, msg:{type:'VERIFY_NOW'}}, '*')` on a live Meesho/Flipkart tab).
 
+Two one-time tools exist for the CSV→Sheet migration (kept in the codebase, not deleted after use, in case the Sheet ever needs recreating): `CREATE_MANIFEST_SHEET` (creates a fresh Sheet in `DRIVE_FOLDERS.DOWNLOAD_MANIFEST`, returns the new `spreadsheetId` — must be hand-copied into `DOWNLOAD_MANIFEST_SHEET_ID` in config.js) and `DELETE_MANIFEST_CSV` (trashes the old CSV file, recoverable via Drive Trash — only run after the Sheet is verified correct).
+
 ### History: known-bad before 2026-07-11, fixed and backfilled since
 
 Every row up to and including 2026-07-10 was written by an older, broken version of this check — one that verified "was anything uploaded in the last few minutes" instead of "does data for this date exist." Since the check re-runs after every recheck mini-sync, and each recheck resets what "the last few minutes" means, a recheck routinely wiped out the correct `Verified` status of ~20 *other*, unrelated jobs, replacing it with a false `Missing`. Confirmed via `rumee_sync_log.csv` (same Data Date logging "21 verified, 2 missing" then "0 verified, 23 missing" 6 minutes later) and by direct comparison against real Drive files (130 of 285 spot-checked rows were false negatives).
@@ -1921,6 +1933,7 @@ Every row up to and including 2026-07-10 was written by an older, broken version
 
 ### For Dashboard / other downstream readers
 
+- **This is now a Google Sheet, not a CSV file** (`spreadsheetId` = `DOWNLOAD_MANIFEST_SHEET_ID` in config.js, inside `DRIVE_FOLDERS.DOWNLOAD_MANIFEST`). Two ways to read it: (a) Sheets API `values.get` on range `A:D`, or (b) Drive API `files.export` on the spreadsheet with `mimeType=text/csv` — this returns the same 4 columns as plain CSV bytes without needing the Sheets API at all, if that's a smaller change on Dashboard's side.
 - Join on **Data Date**, not Run Date.
 - A `Missing` row can flip to `Verified` on a later date's row write (upsert in place) — if reading this file on a schedule, a `Missing` seen today isn't necessarily permanent; re-check before treating it as final data loss.
 - Presence ≠ correctness (see limitation above) — this file answers "did the job produce a file," not "is the data in that file right."
@@ -1928,5 +1941,5 @@ Every row up to and including 2026-07-10 was written by an older, broken version
 
 ---
 
-*Document version: 1.4 — Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. (v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
+*Document version: 1.5 — Section 25 updated 2026-07-11: download_manifest.csv migrated to a native Google Sheet (`drive/sheets.js`, `DOWNLOAD_MANIFEST_SHEET_ID`) after the CSV was found silently reformatted by an external spreadsheet-app open+save; Dashboard read-path note updated. (v1.4: Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
 *Companion files: `recording.md` (UI navigation details), `config.js` (all job and folder definitions), `gap-catchup.js` / `gap-catchup.test.js` (retry-on-failure system)*
