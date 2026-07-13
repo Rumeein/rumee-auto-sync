@@ -50,7 +50,7 @@
     },
     {
       "matches": ["https://seller.flipkart.com/*"],
-      "js": ["ist-time.js", "gap-catchup.js", "config.js", "content/flipkart.js"],
+      "js": ["ist-time.js", "gap-catchup.js", "report-confirm-fallback.js", "config.js", "content/flipkart.js"],
       "run_at": "document_idle"
     }
   ],
@@ -64,7 +64,7 @@
 
   "web_accessible_resources": [
     {
-      "resources": ["log.html", "logger.js", "secrets.js", "config.js", "ist-time.js", "gap-catchup.js"],
+      "resources": ["log.html", "logger.js", "secrets.js", "config.js", "ist-time.js", "gap-catchup.js", "report-confirm-fallback.js"],
       "matches":   ["<all_urls>"]
     }
   ],

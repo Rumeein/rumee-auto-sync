@@ -194,8 +194,8 @@ async function startSync(manualJobIds = null) {
   // BEFORE that job runs (it is always last in the queue).
   if (queue.includes('fk_keywords')) {
     notify(
-      '⚠️ Rumee — Setup Required Before Run',
-      'FK Keywords is queued (runs last).\n\nWhen all other jobs finish, navigate:\nFlipkart → Growth → Seller Insights → Traffic Report → click "Latest" → click "All"\n\nYou will get another prompt when it is time.'
+      'Rumee - Setup Required Before Run',
+      'FK Keywords is queued (runs last).\n\nWhen all other jobs finish, navigate:\nFlipkart -> Growth -> Seller Insights -> Traffic Report -> click "Latest" -> click "All"\n\nYou will get another prompt when it is time.'
     );
   }
 
@@ -965,7 +965,7 @@ async function gcFkAdsTargetDate(jobId) {
 // Record a single-shot job's success/failure into gap-catchup tracking.
 // No-op for any job not in SINGLE_SHOT_GC_JOBS or not enabled — existing
 // behavior for every other job is completely unaffected.
-async function recordSingleShotGapCatchup(jobId, success) {
+async function recordSingleShotGapCatchup(jobId, success, errMsg = null) {
   if (!SINGLE_SHOT_GC_JOBS.includes(jobId)) return;
   if (!(await gcIsEnabledForBg(jobId))) return;
 
@@ -980,7 +980,8 @@ async function recordSingleShotGapCatchup(jobId, success) {
   const r = gcRecordOutcome(gapCatchupPending, jobId, targetDate, todayStr(), success);
   await chrome.storage.local.set({ gapCatchupPending: r.pendingItems });
   if (r.escalated) {
-    await handleGapCatchupEscalated(jobId, r.escalated.date, r.escalated.daysPending);
+    const reason = errMsg ? `${errMsg} (after ${r.escalated.daysPending} days)` : null;
+    await handleGapCatchupEscalated(jobId, r.escalated.date, r.escalated.daysPending, reason);
   }
 }
 
@@ -999,7 +1000,7 @@ async function markJobResult(jobId, success, errMsg = null) {
       syncFailed: [...syncFailed, { id: jobId, error: errMsg }],
     });
   }
-  await recordSingleShotGapCatchup(jobId, success);
+  await recordSingleShotGapCatchup(jobId, success, errMsg);
   await chrome.storage.local.remove('currentJobId');
 }
 

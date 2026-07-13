@@ -285,6 +285,19 @@ async function clickAndWait(el, ms = 1000) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Flipkart's calendar widgets (react-dates, shared across Reports Centre and
+// All Returns) sometimes render a day cell that LOOKS normal but hasn't been
+// "opened" yet for that report/closure period â€” confirmed live 2026-07-13:
+// the cell keeps its regular CalendarDay classes but gets pointer-events:none,
+// so a click silently no-ops instead of throwing. Checking this BEFORE
+// clicking avoids wasting a full submit/wait cycle on a date that was never
+// actually selectable â€” the day becomes available on a later date, so this
+// is expected/recoverable, not a real failure.
+function isFkCalendarDayDisabled(cellEl) {
+  if (!cellEl) return false;
+  return getComputedStyle(cellEl).pointerEvents === 'none';
+}
+
 /**
  * Dismiss any modal / ad / promo / cookie popup that Flipkart shows on page load.
  * Tries up to 3 rounds (popups can stack). Safe to call when no popup is present.
@@ -686,10 +699,12 @@ async function gcAttemptFkPlacementCatchup(job, cfg) {
     text: `GapCatchup: retrying stuck submission for ${oldest.date} (day ${oldest.daysPending})` });
 
   let success = false;
+  let lastError = null;
   try {
     await requestNewFkReport(cfg, oldest.date, job.id);
     success = true;
   } catch (e) {
+    lastError = e.message;
     chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id,
       text: `GapCatchup: retry submit failed for ${oldest.date}: ${e.message}` });
   }
@@ -703,7 +718,7 @@ async function gcAttemptFkPlacementCatchup(job, cfg) {
     const r = gcRecordOutcome(pending, job.id, oldest.date, today, false);
     pending = r.pendingItems;
     if (r.escalated) {
-      chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: job.id, date: r.escalated.date, daysPending: r.escalated.daysPending });
+      chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: job.id, date: r.escalated.date, daysPending: r.escalated.daysPending, reason: lastError ? `${lastError} (after ${r.escalated.daysPending} days)` : undefined });
     }
   }
   await new Promise(res => chrome.storage.local.set({ gapCatchupPending: pending }, res));
@@ -781,7 +796,7 @@ async function _handleFkReportsCentreInner(job, cfg) {
           const r = gcRecordOutcome(gapCatchupPending, job.id, yesterday, todayISO(), false);
           await new Promise(res => chrome.storage.local.set({ gapCatchupPending: r.pendingItems }, res));
           if (r.escalated) {
-            chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: job.id, date: r.escalated.date, daysPending: r.escalated.daysPending });
+            chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: job.id, date: r.escalated.date, daysPending: r.escalated.daysPending, reason: `${e.message} (after ${r.escalated.daysPending} days)` });
           }
         }
         throw e; // preserve existing behavior â€” job is still marked failed today
@@ -1287,8 +1302,23 @@ async function requestNewFkReport(cfg, date, jobId = 'fk_report') {
 
   // END = yesterday. Re-find the cell (DOM can re-render after the start click).
   const endCell = findDayCell(d, targetMonthText1, targetMonthText2) || calCell;
+  if (isFkCalendarDayDisabled(endCell)) {
+    throw new Error(`FK_REPORTS: report period for ${date} not yet available on Flipkart (calendar day disabled) â€” will retry automatically`);
+  }
   await clickAndWait(endCell, 800 + Math.floor(Math.random() * 600));
   chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId, text: `StepE: clicked end date ${date} (range ${sD}â†’${d}) âœ“` });
+
+  // Flipkart sometimes hasn't opened this reporting period yet (confirmed live,
+  // 2026-07-13) â€” the end-day cell LOOKS clickable but the click silently no-ops
+  // internally, and the date-range display shows "Invalid date" instead of the
+  // selected date. This is expected/recoverable (the day becomes available on a
+  // later day), not a real failure â€” skip SUBMIT entirely instead of wasting the
+  // full 15s banner-wait on a request we already know will not go through.
+  const invalidDateShown = Array.from(document.querySelectorAll('*'))
+    .some(el => el.children.length === 0 && el.offsetParent && /invalid date/i.test(el.textContent));
+  if (invalidDateShown) {
+    throw new Error(`FK_REPORTS: report period for ${date} not yet available on Flipkart (calendar shows Invalid date) â€” will retry automatically`);
+  }
 
   // â”€â”€ Step F: Submit + verify success banner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Wait for calendar to close before looking for submit button (human-like pause)
@@ -1320,7 +1350,24 @@ async function requestNewFkReport(cfg, date, jobId = 'fk_report') {
   if (!confirmed) {
     // Check if an error banner appeared instead
     const bodyText = (document.body.innerText || document.body.textContent || '').toLowerCase();
-    if (bodyText.includes('already been requested') || bodyText.includes('already requested')) {
+    const duplicateBannerSeen = bodyText.includes('already been requested') || bodyText.includes('already requested');
+    chrome.runtime.sendMessage({ type:'LOG_DEBUG', jobId, text:`no-banner bodyText snippet: ${bodyText.replace(/\s+/g,' ').trim().slice(0, 300)}` });
+
+    // Neither toast is a reliable signal on its own — Chrome can throttle this
+    // tab's timers so badly that a transient toast appears and disappears
+    // between checks (see memory item 22, confirmed via log timestamps: a
+    // nominal 15s poll took up to 9m47s in practice). Fall back to the durable
+    // Reports Centre row list, which doesn't vanish after a few seconds the
+    // way a toast does.
+    await ensureOnReportsCentre(true);
+    const rowScanResult = findReportRowDownloadBtn(cfg.requestSubType, date, jobId);
+    const decision = decideReportSubmissionOutcome({ bannerConfirmed: false, duplicateBannerSeen, rowScanResult });
+
+    if (decision.outcome === 'confirmed') {
+      chrome.runtime.sendMessage({ type:'LOG_DEBUG', jobId, text:`âœ“ Report request confirmed via row-scan fallback: "${cfg.requestSubType}" for ${date} (row status: ${rowScanResult.status})` });
+      return;
+    }
+    if (decision.outcome === 'duplicate_blocked') {
       throw new Error(`FK_REPORTS: duplicate request blocked â€” "${cfg.requestSubType}" already requested today`);
     }
     debugPage(`rc-submit-no-banner-${cfg.requestSubType}`, jobId);
@@ -2573,6 +2620,18 @@ async function handleFkReturnsRequest(job) {
       .find(el => el.textContent.trim() === 'Date of Closure') || null;
     if (!dateFilterEl) await sleep(1000);
   }
+  if (!dateFilterEl) {
+    await rlog('"Date of Closure" filter not found after 10s — retrying tab click once');
+    allTab.click();
+    await sleep(5000);
+    const retryDeadline = Date.now() + 12000;
+    while (!dateFilterEl && Date.now() < retryDeadline) {
+      dateFilterEl = Array.from(document.querySelectorAll('button, div, span, [role="button"]'))
+        .filter(el => el.offsetParent)
+        .find(el => el.textContent.trim() === 'Date of Closure') || null;
+      if (!dateFilterEl) await sleep(1000);
+    }
+  }
   if (!dateFilterEl) throw new Error('FkReturns: "Date of Closure" filter not found');
   dateFilterEl.click();
   await sleep(1500);
@@ -2629,6 +2688,9 @@ async function handleFkReturnsRequest(job) {
   const dayCells = Array.from(calPanel.querySelectorAll('td'))
     .filter(el => el.textContent.trim() === String(dayNum));
   if (!dayCells.length) throw new Error(`FkReturns: Day ${dayNum} not found in calendar`);
+  if (isFkCalendarDayDisabled(dayCells[0])) {
+    throw new Error(`FkReturns: report period for ${yesterday} not yet available on Flipkart (calendar day disabled) â€” will retry automatically`);
+  }
   dayCells[0].click();
   await sleep(800);
 
@@ -2847,7 +2909,7 @@ async function gcCheckFkRCPending() {
       const r = gcRecordOutcome(pending, jobId, item.date, today, false);
       pending = r.pendingItems;
       if (r.escalated) {
-        chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId, date: r.escalated.date, daysPending: r.escalated.daysPending });
+        chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId, date: r.escalated.date, daysPending: r.escalated.daysPending, reason: `report was requested but Flipkart still hasn't generated it after ${r.escalated.daysPending} days` });
       } else {
         chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId,
           text: `GapCatchup: ${item.date} still not ready (day ${r.pendingItems[jobId]?.[0]?.daysPending || '?'})` });
@@ -2927,7 +2989,7 @@ async function handleFkRCDownload(job) {
         const r = gcRecordOutcome(gcState, p.jobId, yesterday, today, false);
         gcState = gcMarkPlaced(r.pendingItems, p.jobId, yesterday); // submitted OK, just not ready
         if (r.escalated) {
-          chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: p.jobId, date: r.escalated.date, daysPending: r.escalated.daysPending });
+          chrome.runtime.sendMessage({ type: 'GAP_CATCHUP_ESCALATED', jobId: p.jobId, date: r.escalated.date, daysPending: r.escalated.daysPending, reason: `report was requested but Flipkart still hasn't generated it after ${r.escalated.daysPending} days (3 hourly rechecks exhausted each day)` });
         }
       }
       await new Promise(res => chrome.storage.local.set({ gapCatchupPending: gcState }, res));
