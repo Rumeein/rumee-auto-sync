@@ -1508,6 +1508,37 @@ re-upload it (a wrong guess would land the file in the wrong Drive folder) — t
 job either gets auto-retried by the gap self-healing system (Section 24) if it's
 one of the covered jobs, or shows up as a normal failure in the log.
 
+### Open: fk_views and fk_claims failures — no root cause yet, deliberately not guess-fixed (2026-07-13)
+
+Two separate jobs have failed with generic messages and **zero diagnostic evidence
+captured at the failure point** — checked the full historical log for both and
+found nothing beyond the bare error string:
+- `fk_views`: "Custom Dates button not found" (once, 2026-07-09) and separately
+  "no relayed download URL within timeout" (same day, later run). A `debugPage()`
+  call exists in the code for the first case but never actually produced a
+  snapshot for this occurrence.
+- `fk_claims`: "no relayed download URL within timeout" (once, 2026-07-12). No
+  diagnostic call exists at this throw site at all.
+
+Popup-permission was checked and ruled out for both (`seller.flipkart.com` is
+still in Chrome's allow list). Whether either shares the calendar-disabled-day
+root cause found for fk_payments/fk_orders/fk_returns (see Section 23) or
+Chrome's timer-throttling issue, or something else entirely, is **not yet known**
+— explicitly not guessed at. User's call: keep observing rather than build a fix
+without evidence. Recommended next step whenever this is picked up: add the same
+lightweight page-state logging pattern already proven for fk_payments (a text
+snippet logged right at the failure point) to these 3 throw sites first, so the
+next occurrence actually produces evidence.
+
+### Open: daily "AutoSync complete" Discord summary has no failure reason (2026-07-13)
+
+The escalation notification (3+ days stuck, Section 24) now carries the real
+failure reason (fixed 2026-07-13). The separate, more frequent **daily** summary
+(`verifyAndLogManifest()`, posted every sync) still only lists missing filenames
+with zero explanation. Fixing it needs mapping each of the ~22 `MANIFEST_SLOTS`
+entries to its owning job ID to cross-reference `syncFailed` — a bigger, riskier
+change than the escalation fix, deliberately deferred rather than rushed.
+
 ---
 
 ## 19. How to Add a New Report
@@ -1713,6 +1744,10 @@ After each RC job run, `handleFkRCReport` checks which sub-reports are still mis
 
 **Confirmed via test:** A test using date range Jun 1→Jun 2 (historical, data already finalized) showed the green success banner appearing correctly within 15 seconds. The banner detection code works — it's purely a data-availability timing issue.
 
+**UPDATE 2026-07-13 — a second, earlier-stage symptom of the same underlying cause, confirmed live:** before the report is even submittable, Flipkart's calendar can render the target day (yesterday) with normal `CalendarDay` styling but `pointer-events: none` — it looks clickable but a click silently no-ops, leaving the date-range display showing "Invalid date" instead of a real end date. This is one step earlier than the afternoon-timing case above (that one submits successfully and waits; this one can't even select the date yet). Also confirmed separately: Chrome throttles the automation tab's JS timers badly enough that the 15-second banner-wait poll can silently stretch to 9+ minutes when the tab isn't focused, which can independently cause the same "banner never appeared" symptom via detection failure rather than a real submission problem — see the row-scan fallback below.
+**Fix (content/flipkart.js):** `isFkCalendarDayDisabled(cellEl)` checks `getComputedStyle(cellEl).pointerEvents === 'none'` on the target day cell BEFORE clicking it. Applied to `requestNewFkReport()` (shared by `fk_orders`/`fk_payments`) and `handleFkReturnsRequest()` (`fk_returns`). When the day is disabled, the job throws immediately with a clear "not yet available — will retry automatically" message instead of wasting a full submit + 15s-banner-wait cycle, and gap-catchup picks it up on a later run exactly like any other stuck submission. Not yet extended to `fk_views`' separate calendar — that job's failures are still being observed, not yet confirmed to share this cause.
+**Fix (report-confirm-fallback.js, new file):** when the banner-wait genuinely times out and neither a success nor "already requested" toast was seen, `requestNewFkReport()` now falls back to re-scanning the Reports Centre row list (`findReportRowDownloadBtn()`) instead of assuming failure — a row already existing (Generated or in-progress) is treated as confirmed, since a durable table row can't disappear the way a transient toast can. Live-verified both branches (a real Generated row correctly rescues as confirmed; a genuinely absent row correctly still reports failure).
+
 ---
 
 ### FK Reports Centre — Calendar Picker UI
@@ -1863,6 +1898,8 @@ When logs show repeated "rejecting this header — N month labels", this is expe
 ### Manual escalation
 
 When a job gives up (3 days of retrying, or the immediate fk_returns case): a Discord message posts to the `#auto-sync` webhook, a Chrome desktop notification fires, and the item appears in the extension popup under "⚠ Manual Action Needed" with a "Mark Done" button. Click it once you've downloaded the file by hand and placed it in the right Drive folder — that's the only thing that clears the item from the list.
+
+**Updated 2026-07-13 — the message now says why, not just that it failed.** Previously this notification only ever said "could not be auto-completed after N days" regardless of what actually went wrong. The real underlying error (e.g. "report period not yet available on Flipkart", a specific submission error, or "Flipkart still hasn't generated it") is now threaded through from wherever the failure was recorded — both the two-phase FK jobs (content/flipkart.js, `GAP_CATCHUP_ESCALATED` message now carries a `reason`) and the single-shot jobs (background.js, `markJobResult`'s `errMsg` now flows through `recordSingleShotGapCatchup` into the escalation). Not yet observed live — needs a real 3-day escalation to prove, same as the rest of this system per the note above.
 
 ### Kill switch — staged rollout, instant rollback
 
