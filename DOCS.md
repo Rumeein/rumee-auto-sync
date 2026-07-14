@@ -1508,36 +1508,60 @@ re-upload it (a wrong guess would land the file in the wrong Drive folder) — t
 job either gets auto-retried by the gap self-healing system (Section 24) if it's
 one of the covered jobs, or shows up as a normal failure in the log.
 
-### Open: fk_views and fk_claims failures — no root cause yet, deliberately not guess-fixed (2026-07-13)
+### fk_views and fk_claims failures — diagnostic logging added, root cause still unknown (2026-07-13, logging added 2026-07-14)
 
 Two separate jobs have failed with generic messages and **zero diagnostic evidence
 captured at the failure point** — checked the full historical log for both and
 found nothing beyond the bare error string:
 - `fk_views`: "Custom Dates button not found" (once, 2026-07-09) and separately
-  "no relayed download URL within timeout" (same day, later run). A `debugPage()`
-  call exists in the code for the first case but never actually produced a
-  snapshot for this occurrence.
-- `fk_claims`: "no relayed download URL within timeout" (once, 2026-07-12). No
-  diagnostic call exists at this throw site at all.
+  "no relayed download URL within timeout" (same day, later run).
+- `fk_claims`: "no relayed download URL within timeout" (once, 2026-07-12).
 
 Popup-permission was checked and ruled out for both (`seller.flipkart.com` is
 still in Chrome's allow list). Whether either shares the calendar-disabled-day
 root cause found for fk_payments/fk_orders/fk_returns (see Section 23) or
-Chrome's timer-throttling issue, or something else entirely, is **not yet known**
-— explicitly not guessed at. User's call: keep observing rather than build a fix
-without evidence. Recommended next step whenever this is picked up: add the same
-lightweight page-state logging pattern already proven for fk_payments (a text
-snippet logged right at the failure point) to these 3 throw sites first, so the
-next occurrence actually produces evidence.
+Chrome's timer-throttling issue, or something else entirely, is **still not
+known** — explicitly not guessed at.
 
-### Open: daily "AutoSync complete" Discord summary has no failure reason (2026-07-13)
+**2026-07-14:** added the same lightweight `bodyText` snippet logging (already
+proven for fk_payments' banner-timeout case) to all 3 throw sites — fk_views'
+two failure points and fk_claims' one. Zero behavior change, purely diagnostic.
+Not yet fired against a real occurrence — the next time any of these 3 fail,
+the log will finally show what the page actually looked like, instead of
+another dead end.
 
-The escalation notification (3+ days stuck, Section 24) now carries the real
+### Daily "AutoSync complete" Discord summary — RESOLVED (2026-07-14)
+
+The escalation notification (3+ days stuck, Section 24) already carried the real
 failure reason (fixed 2026-07-13). The separate, more frequent **daily** summary
-(`verifyAndLogManifest()`, posted every sync) still only lists missing filenames
-with zero explanation. Fixing it needs mapping each of the ~22 `MANIFEST_SLOTS`
-entries to its owning job ID to cross-reference `syncFailed` — a bigger, riskier
-change than the escalation fix, deliberately deferred rather than rushed.
+(`verifyAndLogManifest()`, posted every sync) previously only listed missing
+filenames with zero explanation.
+
+**Root cause of why this was harder than the escalation fix:** the daily summary
+looked up a job's failure reason in `syncFailed` — a list that `startSync()`
+resets to `[]` at the start of **every** sync, including narrow single-job
+recheck mini-syncs (`fk_rc_download` recheck, `fk_views_recheck`, etc.). A
+recheck for a completely unrelated job would silently wipe the real reason
+before the next daily summary post, even though the original problem hadn't
+changed — confirmed live via `chrome.storage.local` inspection, not guessed.
+
+**Fix:** each Missing slot's `folderKey` is mapped to its owning job id(s) at
+runtime (grouped from `JOBS` itself — two-phase jobs like `fk_orders`/
+`fk_rc_download` share one folder, so a slot can map to more than one id). The
+reason now comes from a new persistent `lastJobError` map (`background.js`,
+`markJobResult()`) keyed by job id — set on failure, cleared only on that same
+job's *next success* — never touched by an unrelated sync/recheck starting.
+Shows `filename — reason` when a real error is recorded, bare `filename` when
+none exists (self-skip, e.g. 0 live ad campaigns, or a job still pending a
+recheck) — never fabricates a reason. Not yet observed live against a real
+failure + subsequent unrelated recheck cycle since the fix landed.
+
+### Chrome sync-complete notification — now includes failure reason (2026-07-14)
+
+Previously showed only job IDs on failure (e.g. `❌ 1 failed: fk_payments`).
+Now includes each job's real recorded error, capped at 60 characters so the
+desktop toast stays short (e.g. `fk_payments (FK_REPORTS: SUBMIT clicked but
+success banner never appear)`). Same `finishSync()` function, one-line change.
 
 ---
 
@@ -1745,7 +1769,9 @@ After each RC job run, `handleFkRCReport` checks which sub-reports are still mis
 **Confirmed via test:** A test using date range Jun 1→Jun 2 (historical, data already finalized) showed the green success banner appearing correctly within 15 seconds. The banner detection code works — it's purely a data-availability timing issue.
 
 **UPDATE 2026-07-13 — a second, earlier-stage symptom of the same underlying cause, confirmed live:** before the report is even submittable, Flipkart's calendar can render the target day (yesterday) with normal `CalendarDay` styling but `pointer-events: none` — it looks clickable but a click silently no-ops, leaving the date-range display showing "Invalid date" instead of a real end date. This is one step earlier than the afternoon-timing case above (that one submits successfully and waits; this one can't even select the date yet). Also confirmed separately: Chrome throttles the automation tab's JS timers badly enough that the 15-second banner-wait poll can silently stretch to 9+ minutes when the tab isn't focused, which can independently cause the same "banner never appeared" symptom via detection failure rather than a real submission problem — see the row-scan fallback below.
-**Fix (content/flipkart.js):** `isFkCalendarDayDisabled(cellEl)` checks `getComputedStyle(cellEl).pointerEvents === 'none'` on the target day cell BEFORE clicking it. Applied to `requestNewFkReport()` (shared by `fk_orders`/`fk_payments`) and `handleFkReturnsRequest()` (`fk_returns`). When the day is disabled, the job throws immediately with a clear "not yet available — will retry automatically" message instead of wasting a full submit + 15s-banner-wait cycle, and gap-catchup picks it up on a later run exactly like any other stuck submission. Not yet extended to `fk_views`' separate calendar — that job's failures are still being observed, not yet confirmed to share this cause.
+
+**UPDATE 2026-07-14 — a second, distinct disabling mechanism found, confirmed live via DevTools console (not guessed):** the `pointer-events: none` case above is not the only way Flipkart disables a calendar day. A separate mechanism — the `CalendarDay__blocked_out_of_range` class, applied when a day is genuinely outside the currently selectable range — does **not** set `pointer-events: none` at all. Confirmed by direct inspection: a blocked cell reports `cursor: no-drop`, computed `pointerEvents` stays its normal value; a genuinely clickable cell reports `cursor: pointer`. Same visual result (grayed out, unselectable), two different CSS techniques underneath — one check could never catch both.
+**Fix (content/flipkart.js):** `isFkCalendarDayDisabled(cellEl)` now checks `getComputedStyle(cellEl).pointerEvents === 'none'` **OR** `getComputedStyle(cellEl).cursor !== 'pointer'` on the target day cell BEFORE clicking it. The second check is deliberately general (tests the cursor, not the specific class name) so it should also catch any future disabling variant Flipkart introduces the same way. Applied to `requestNewFkReport()` (shared by `fk_orders`/`fk_payments`) and `handleFkReturnsRequest()` (`fk_returns`) — the only 3 jobs using this calendar widget; the other 22 jobs use a different platform or a different date-input mechanism entirely, so this fix does not apply to them. When the day is disabled (either mechanism), the job throws immediately with a clear "not yet available — will retry automatically" message instead of wasting a full submit + 15s-banner-wait cycle, and gap-catchup picks it up on a later run exactly like any other stuck submission. Not yet extended to `fk_views`' separate calendar — that job's failures are still being observed, not yet confirmed to share this cause.
 **Fix (report-confirm-fallback.js, new file):** when the banner-wait genuinely times out and neither a success nor "already requested" toast was seen, `requestNewFkReport()` now falls back to re-scanning the Reports Centre row list (`findReportRowDownloadBtn()`) instead of assuming failure — a row already existing (Generated or in-progress) is treated as confirmed, since a durable table row can't disappear the way a transient toast can. Live-verified both branches (a real Generated row correctly rescues as confirmed; a genuinely absent row correctly still reports failure).
 
 ---
@@ -1989,5 +2015,5 @@ Every row up to and including 2026-07-10 was written by an older, broken version
 
 ---
 
-*Document version: 1.6 — Section 25 updated 2026-07-11: ads summary/catalog File Name column cleaned up (`meesho_ads_summary_1`/`_2` instead of the real per-campaign, per-date filename), full history rebuilt, Dashboard read-path note updated. (v1.5: Section 25 updated 2026-07-11: download_manifest.csv migrated to a native Google Sheet (`drive/sheets.js`, `DOWNLOAD_MANIFEST_SHEET_ID`) after the CSV was found silently reformatted by an external spreadsheet-app open+save; Dashboard read-path note updated. v1.4: Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
+*Document version: 1.7 — Section 18 updated 2026-07-14: fk_views/fk_claims diagnostic logging added (root cause still unknown); daily Discord manifest summary reason-blanking bug resolved (persistent `lastJobError` map replaces the transient, recheck-wiped `syncFailed`); Chrome sync-complete notification now includes each failure's real reason. Section 23 updated 2026-07-14: `isFkCalendarDayDisabled()` now checks two distinct, independently-confirmed disabling mechanisms (`pointer-events:none` and `cursor !== 'pointer'`), not just one — the second was missed by the 2026-07-13 fix and only found via live DevTools inspection. (v1.6: Section 25 updated 2026-07-11: ads summary/catalog File Name column cleaned up (`meesho_ads_summary_1`/`_2` instead of the real per-campaign, per-date filename), full history rebuilt, Dashboard read-path note updated. v1.5: Section 25 updated 2026-07-11: download_manifest.csv migrated to a native Google Sheet (`drive/sheets.js`, `DOWNLOAD_MANIFEST_SHEET_ID`) after the CSV was found silently reformatted by an external spreadsheet-app open+save; Dashboard read-path note updated. v1.4: Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
 *Companion files: `recording.md` (UI navigation details), `config.js` (all job and folder definitions), `gap-catchup.js` / `gap-catchup.test.js` (retry-on-failure system)*
