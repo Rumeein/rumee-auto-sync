@@ -1387,6 +1387,23 @@ Click extension icon → popup shows:
    - Portal UI changed → the content script may need updating
 3. Re-run the failed job via popup → "Run Now" → select specific job
 
+### If a sync stops mid-run because a portal isn't logged in (added 2026-07-14)
+
+If a job hits "login required" partway through a sync (e.g. Flipkart jobs ran
+fine but Meesho isn't logged in when its jobs come up — daily order is FK
+jobs first, then Meesho), the extension stops there and shows a "Login
+Required" notification.
+
+**Log into the portal, then click "Resume Sync" in the popup — not "Run Now."**
+A **"▶ Resume Sync"** button appears (only when there's actually something to
+resume; otherwise it stays hidden) and continues with exactly the jobs that
+hadn't run yet — it does not re-run anything that already succeeded, and does
+not re-attempt the job that failed on login (that one stays recorded as
+today's failure; re-run it individually later if needed, same as any other
+single failed job above). "Run Now" is unaffected by this and still means what
+it always has — deliberately re-running specific jobs regardless of whether
+they already ran today.
+
 ### Changing the Schedule
 
 Popup → Schedule section → change hour/minute → Save. The alarm is recreated immediately.
@@ -2015,5 +2032,5 @@ Every row up to and including 2026-07-10 was written by an older, broken version
 
 ---
 
-*Document version: 1.7 — Section 18 updated 2026-07-14: fk_views/fk_claims diagnostic logging added (root cause still unknown); daily Discord manifest summary reason-blanking bug resolved (persistent `lastJobError` map replaces the transient, recheck-wiped `syncFailed`); Chrome sync-complete notification now includes each failure's real reason. Section 23 updated 2026-07-14: `isFkCalendarDayDisabled()` now checks two distinct, independently-confirmed disabling mechanisms (`pointer-events:none` and `cursor !== 'pointer'`), not just one — the second was missed by the 2026-07-13 fix and only found via live DevTools inspection. (v1.6: Section 25 updated 2026-07-11: ads summary/catalog File Name column cleaned up (`meesho_ads_summary_1`/`_2` instead of the real per-campaign, per-date filename), full history rebuilt, Dashboard read-path note updated. v1.5: Section 25 updated 2026-07-11: download_manifest.csv migrated to a native Google Sheet (`drive/sheets.js`, `DOWNLOAD_MANIFEST_SHEET_ID`) after the CSV was found silently reformatted by an external spreadsheet-app open+save; Dashboard read-path note updated. v1.4: Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
+*Document version: 1.8 — Section 16 updated 2026-07-14: new "Resume Sync" button — a login-required interruption mid-sync no longer wipes the remaining queue; Resume continues exactly where it stopped instead of "Run Now" restarting everything (including jobs that already succeeded). (v1.7: Section 18 updated 2026-07-14: fk_views/fk_claims diagnostic logging added (root cause still unknown); daily Discord manifest summary reason-blanking bug resolved (persistent `lastJobError` map replaces the transient, recheck-wiped `syncFailed`); Chrome sync-complete notification now includes each failure's real reason. Section 23 updated 2026-07-14: `isFkCalendarDayDisabled()` now checks two distinct, independently-confirmed disabling mechanisms (`pointer-events:none` and `cursor !== 'pointer'`), not just one — the second was missed by the 2026-07-13 fix and only found via live DevTools inspection. v1.6: Section 25 updated 2026-07-11: ads summary/catalog File Name column cleaned up (`meesho_ads_summary_1`/`_2` instead of the real per-campaign, per-date filename), full history rebuilt, Dashboard read-path note updated. v1.5: Section 25 updated 2026-07-11: download_manifest.csv migrated to a native Google Sheet (`drive/sheets.js`, `DOWNLOAD_MANIFEST_SHEET_ID`) after the CSV was found silently reformatted by an external spreadsheet-app open+save; Dashboard read-path note updated. v1.4: Section 25 added 2026-07-11: download_manifest.csv format, verification logic, the timing bug found + fixed (commit 65c597e), and the full history rebuild. Section 17 updated with a pointer to it. v1.3: Section 24 added 2026-07-10 — gap self-healing retry system. Section 20 updated: MEESHO_SUPPLIER_SLUG as a second per-install config value. Section 23's "Multiple Concurrent Sync Runs" corrected — that mechanism never existed; see Section 24 for what actually handles retry now. v1.2: Sections 19–20 added 2026-06-13 — multi-account use + Chrome Web Store publishing reference; Section 13 updated — auto folder creation setup flow.)*  
 *Companion files: `recording.md` (UI navigation details), `config.js` (all job and folder definitions), `gap-catchup.js` / `gap-catchup.test.js` (retry-on-failure system)*
