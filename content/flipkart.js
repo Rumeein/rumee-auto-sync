@@ -2320,7 +2320,12 @@ async function fkViewsSelectRange(job, fromISO, toISO) {
 
   const customBtn = findBtn('Custom Dates') || findBtn('Custom Date')
     || findEl(['Custom Dates', 'Custom Date'], 'button, li, [role="button"], div');
-  if (!customBtn) { debugPage('views2-no-custom', job.id); throw new Error('FK_VIEWS: Custom Dates button not found'); }
+  if (!customBtn) {
+    const bodyText = (document.body.innerText || document.body.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id, text: `views2-no-custom bodyText snippet: ${bodyText}` });
+    debugPage('views2-no-custom', job.id);
+    throw new Error('FK_VIEWS: Custom Dates button not found');
+  }
   await clickAndWait(customBtn, 1500);
 
   // ALWAYS two clicks â€” start then end. Verified live (probe, 2026-06-11): a
@@ -2502,6 +2507,8 @@ async function handleFkViewsDownload(job) {
     await clickAndWait(state.downloadBtn, 300);
     const relayed = await pollStorageForRelay(TIMEOUT_MS);
     if (!relayed) {
+      const bodyText = (document.body.innerText || document.body.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+      chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id, text: `views2-no-relay bodyText snippet: ${bodyText}` });
       chrome.runtime.sendMessage({ type: 'RELAY_DISARM' });
       throw new Error('FK_VIEWS: no relayed download URL within timeout');
     }
@@ -3242,6 +3249,8 @@ async function handleFkClaims(job) {
   const relayed = await pollStorageForRelay(TIMEOUT_MS);
   _currentJob = job;
   if (!relayed) {
+    const bodyText = (document.body.innerText || document.body.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    chrome.runtime.sendMessage({ type: 'LOG_DEBUG', jobId: job.id, text: `claims-no-relay bodyText snippet: ${bodyText}` });
     chrome.runtime.sendMessage({ type: 'RELAY_DISARM' });
     throw new Error('FK_CLAIMS: no relayed download URL within timeout');
   }
