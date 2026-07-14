@@ -1883,12 +1883,12 @@ async function verifyAndLogManifest() {
         // campaign always lands on the same _N suffix across reruns, instead
         // of depending on Drive's list-order (which isn't guaranteed stable).
         const ordered = fresh.slice().sort((a, b) => a.name.localeCompare(b.name));
-        ordered.forEach((f, i) => { results.push({ fileName: `${slot.label}_${i + 1}`, status: 'Verified' }); verified++; });
+        ordered.forEach((f, i) => { results.push({ fileName: `${slot.label}_${i + 1}`, status: 'Verified', folderKey: slot.folderKey }); verified++; });
       } else {
-        results.push({ fileName: slot.label, status: 'Missing' }); missing++;
+        results.push({ fileName: slot.label, status: 'Missing', folderKey: slot.folderKey }); missing++;
       }
     } else {
-      results.push({ fileName: slot.label, status: fresh.length ? 'Verified' : 'Missing' });
+      results.push({ fileName: slot.label, status: fresh.length ? 'Verified' : 'Missing', folderKey: slot.folderKey });
       if (fresh.length) verified++; else missing++;
     }
   }
@@ -1921,11 +1921,27 @@ async function verifyAndLogManifest() {
   // ── Post summary to Discord #auto-sync ────────────────────────────────────
   try {
     const verifiedList = results.filter(r => r.status === 'Verified').map(r => r.fileName);
-    const missingList  = results.filter(r => r.status === 'Missing').map(r => r.fileName);
+    const missingList  = results.filter(r => r.status === 'Missing');
     const lines = [`**AutoSync complete — ${runDate}**`];
     if (missingList.length) {
+      // Map each Missing slot's folderKey to the job id(s) that write it
+      // (derived from JOBS itself — two-phase jobs like fk_orders/fk_rc_download
+      // share one folderKey, so a slot can map to more than one job id).
+      const jobIdsByFolderKey = {};
+      for (const j of JOBS) (jobIdsByFolderKey[j.folderKey] ||= []).push(j.id);
+      const { syncFailed = [] } = await chrome.storage.local.get(['syncFailed']);
+      const failedById = new Map(syncFailed.map(f => [f.id, f.error]));
+
       lines.push(`✅ ${verifiedList.length}/${results.length} verified`);
-      lines.push(`❌ Missing (${missingList.length}): ${missingList.join(', ')}`);
+      lines.push(`❌ Missing (${missingList.length}):`);
+      for (const r of missingList) {
+        const jobIds = jobIdsByFolderKey[r.folderKey] || [];
+        const failedJobId = jobIds.find(id => failedById.has(id));
+        // No matching syncFailed entry (self-skip, e.g. 0 live campaigns, or a
+        // two-phase job still on a pending recheck) — no real reason to show,
+        // never invent one.
+        lines.push(failedJobId ? `• ${r.fileName} — ${failedById.get(failedJobId)}` : `• ${r.fileName}`);
+      }
       lines.push(`_Pipeline runs at 6:30 PM IST. Upload missing files to Drive before then._`);
     } else {
       lines.push(`✅ All ${results.length}/${results.length} files verified. Pipeline runs at 6:30 PM IST.`);
