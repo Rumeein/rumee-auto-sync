@@ -38,26 +38,29 @@ async function getToken() {
     return;
   }
 
+  const qs = new URLSearchParams({ grant_type: 'client_credentials' });
+  if (scope) qs.set('scope', scope);
+  const url = `${TOKEN_URL}?${qs.toString()}`;
+
   document.getElementById('tokenBtn').disabled = true;
   setTokenStatus('idle', 'Requesting token…');
-  log('POST ' + TOKEN_URL);
+  log('GET ' + url);
 
   try {
     const credentials = btoa(apiKey + ':' + apiSecret);
-    const qs = new URLSearchParams({ grant_type: 'client_credentials' });
-    if (scope) qs.set('scope', scope);
 
     // Store credentials so onAuthRequired listener can supply them if server challenges us
     await chrome.storage.local.set({ fkApiKey: apiKey, fkApiSecret: apiSecret });
 
-    // FK OAuth token endpoint requires POST with body (not GET with query string)
-    const resp = await fetch(TOKEN_URL, {
-      method:  'POST',
+    // Per Flipkart's official Auth Tutorial (seller.flipkart.com/api-docs/listing-api-docs/authTut.html)
+    // and the FK API Platform Hub (flipkart.github.io/fk-api-platform-docs) — both give the same
+    // verbatim curl example: GET with grant_type/scope in the query string, Basic auth header only,
+    // no body, no Content-Type. Confirmed 2026-07-14 against both sources before touching this.
+    const resp = await fetch(url, {
+      method:  'GET',
       headers: {
         'Authorization': 'Basic ' + credentials,
-        'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: qs.toString(),
     });
 
     const raw = await resp.text();

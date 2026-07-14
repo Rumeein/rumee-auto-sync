@@ -986,18 +986,26 @@ async function recordSingleShotGapCatchup(jobId, success, errMsg = null) {
 }
 
 async function markJobResult(jobId, success, errMsg = null) {
-  const { syncDone = [], syncFailed = [], lastRun = {} } =
-    await chrome.storage.local.get(['syncDone', 'syncFailed', 'lastRun']);
+  const { syncDone = [], syncFailed = [], lastRun = {}, lastJobError = {} } =
+    await chrome.storage.local.get(['syncDone', 'syncFailed', 'lastRun', 'lastJobError']);
 
   if (success) {
     lastRun[jobId] = todayStr();
+    // Job's own storage key, keyed by jobId only — untouched by startSync()'s
+    // syncFailed:[] reset (which fires on every sync, including unrelated
+    // single-job rechecks), so this survives long enough for the next daily
+    // manifest/Discord post to still show the real reason.
+    delete lastJobError[jobId];
     await chrome.storage.local.set({
       syncDone: [...syncDone, jobId],
       lastRun,
+      lastJobError,
     });
   } else {
+    lastJobError[jobId] = errMsg;
     await chrome.storage.local.set({
       syncFailed: [...syncFailed, { id: jobId, error: errMsg }],
+      lastJobError,
     });
   }
   await recordSingleShotGapCatchup(jobId, success, errMsg);
@@ -1016,7 +1024,7 @@ async function finishSync(done, failed) {
   // payments, fk_views_request) complete without uploading any file.
   const msg = failed.length === 0
     ? `✅ All ${done.length} job(s) completed.`
-    : `✅ ${done.length} completed  ❌ ${failed.length} failed: ${failed.map(f => f.id).join(', ')}`;
+    : `✅ ${done.length} completed  ❌ ${failed.length} failed: ${failed.map(f => `${f.id} (${(f.error || '').slice(0, 60)})`).join(', ')}`;
 
   const level = failed.length === 0 ? 'success' : 'warn';
   _appendLog({ jobId: 'system', level, msg: `Sync complete — ${done.length} OK, ${failed.length} failed` +
@@ -1929,18 +1937,19 @@ async function verifyAndLogManifest() {
       // share one folderKey, so a slot can map to more than one job id).
       const jobIdsByFolderKey = {};
       for (const j of JOBS) (jobIdsByFolderKey[j.folderKey] ||= []).push(j.id);
-      const { syncFailed = [] } = await chrome.storage.local.get(['syncFailed']);
-      const failedById = new Map(syncFailed.map(f => [f.id, f.error]));
+      // lastJobError (not the transient syncFailed) — persists across unrelated
+      // recheck starts, so it still has the real reason even if this manifest
+      // check runs long after the job actually failed.
+      const { lastJobError = {} } = await chrome.storage.local.get(['lastJobError']);
 
       lines.push(`✅ ${verifiedList.length}/${results.length} verified`);
       lines.push(`❌ Missing (${missingList.length}):`);
       for (const r of missingList) {
         const jobIds = jobIdsByFolderKey[r.folderKey] || [];
-        const failedJobId = jobIds.find(id => failedById.has(id));
-        // No matching syncFailed entry (self-skip, e.g. 0 live campaigns, or a
-        // two-phase job still on a pending recheck) — no real reason to show,
-        // never invent one.
-        lines.push(failedJobId ? `• ${r.fileName} — ${failedById.get(failedJobId)}` : `• ${r.fileName}`);
+        const failedJobId = jobIds.find(id => lastJobError[id]);
+        // No recorded error (self-skip, e.g. 0 live campaigns, or a two-phase
+        // job still on a pending recheck) — no real reason to show, never invent one.
+        lines.push(failedJobId ? `• ${r.fileName} — ${lastJobError[failedJobId]}` : `• ${r.fileName}`);
       }
       lines.push(`_Pipeline runs at 6:30 PM IST. Upload missing files to Drive before then._`);
     } else {

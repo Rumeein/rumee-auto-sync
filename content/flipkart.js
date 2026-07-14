@@ -295,7 +295,13 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // is expected/recoverable, not a real failure.
 function isFkCalendarDayDisabled(cellEl) {
   if (!cellEl) return false;
-  return getComputedStyle(cellEl).pointerEvents === 'none';
+  // Two confirmed, distinct disabling mechanisms Flipkart uses (2026-07-14):
+  // 1. pointer-events:none - day exists but report period not yet opened ("Invalid date" case).
+  // 2. cursor !== 'pointer' (e.g. "no-drop") - day genuinely outside the selectable range
+  //    (CalendarDay__blocked_out_of_range class). Checked via cursor, not the class name
+  //    itself, so this also catches any other disabled variant Flipkart uses the same way.
+  if (getComputedStyle(cellEl).pointerEvents === 'none') return true;
+  return getComputedStyle(cellEl).cursor !== 'pointer';
 }
 
 /**
