@@ -205,6 +205,7 @@ async function startSync(manualJobIds = null) {
     syncDone:     [],
     syncFailed:   [],
     syncStarted:  Date.now(),
+    pausedQueue:  [], // a genuine fresh start supersedes any old unresolved pause
   });
 
   console.log(`[Rumee] Starting sync — ${queue.length} jobs in JOBS order:`, queue);
@@ -638,10 +639,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Popup: resume a sync that stopped early (e.g. login-required) exactly
+  // where it left off — restores the preserved remaining queue instead of
+  // rebuilding one, and does not touch syncDone/syncFailed so the eventual
+  // finishSync() tally still reflects everything from before the pause too.
+  if (msg.type === 'RESUME_SYNC') {
+    (async () => {
+      const { pausedQueue = [] } = await chrome.storage.local.get(['pausedQueue']);
+      if (!pausedQueue.length) { sendResponse({ ok: false, error: 'Nothing to resume' }); return; }
+      await chrome.storage.local.set({
+        syncRunning: true,
+        syncQueue:   pausedQueue,
+        pausedQueue: [],
+        syncStarted: Date.now(),
+      });
+      await processNextJob();
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+
   // Popup: get current sync status
   if (msg.type === 'GET_STATUS') {
     chrome.storage.local.get(
-      ['syncRunning', 'syncQueue', 'syncDone', 'syncFailed', 'lastRun', 'currentJobId'],
+      ['syncRunning', 'syncQueue', 'syncDone', 'syncFailed', 'lastRun', 'currentJobId', 'pausedQueue'],
       data => sendResponse(data)
     );
     return true;
@@ -923,12 +944,21 @@ async function handlePanelLoginRequired(msg) {
   const platformName = msg.platform === 'meesho' ? 'Meesho supplier panel' : 'Flipkart seller hub';
   const domain       = msg.platform === 'meesho' ? 'supplier.meesho.com'   : 'seller.flipkart.com';
   console.warn(`[Rumee] Login required for ${msg.jobId} — panel session not active`);
-  logError(msg.jobId, `✗ Login required — open ${domain} and log in, then Run Now again`);
+  logError(msg.jobId, `✗ Login required — open ${domain}, log in, then tap Resume Sync`);
   notify('Rumee — Login Required',
-    `Please open the ${platformName} and log in, then tap "Run Now" again.`);
+    `Please open the ${platformName} and log in, then tap "Resume Sync".`);
   await markJobResult(msg.jobId, false, `Login required — open ${domain}`);
   await closeCurrentTab();
-  await chrome.storage.local.set({ syncRunning: false, syncQueue: [], lastSyncEndTime: Date.now() });
+  // Preserve whatever's left in the queue instead of discarding it — processNextJob()
+  // already removes a job from syncQueue before running it, so this is exactly
+  // "everything after the job that just failed." Resume Sync restores it later.
+  const { syncQueue = [] } = await chrome.storage.local.get(['syncQueue']);
+  await chrome.storage.local.set({
+    syncRunning: false,
+    syncQueue: [],
+    pausedQueue: syncQueue,
+    lastSyncEndTime: Date.now(),
+  });
 }
 
 // ─── Job result helpers ───────────────────────────────────────────────────────

@@ -235,8 +235,9 @@ function updateProgressSection(data) {
 }
 
 function updateButtons(data) {
-  const runBtn  = document.getElementById('runNowBtn');
-  const stopBtn = document.getElementById('stopBtn');
+  const runBtn    = document.getElementById('runNowBtn');
+  const resumeBtn = document.getElementById('resumeBtn');
+  const stopBtn   = document.getElementById('stopBtn');
 
   // Kill button is ALWAYS visible — it also cancels pending recheck alarms, which
   // can re-trigger navigation even when no sync shows as "running".
@@ -247,6 +248,12 @@ function updateButtons(data) {
     runBtn.classList.remove('hidden');
   }
   runBtn.disabled = data.syncRunning;
+
+  // Resume Sync — only shown/enabled when a sync stopped early (e.g. login
+  // required) and left a preserved queue behind. Hidden the rest of the time.
+  const hasPaused = (data.pausedQueue || []).length > 0;
+  resumeBtn.classList.toggle('hidden', !hasPaused);
+  resumeBtn.disabled = data.syncRunning || !hasPaused;
 }
 
 function updateScheduleInput(data) {
@@ -264,6 +271,12 @@ function attachListeners() {
   document.getElementById('runNowBtn').addEventListener('click', () => {
     const jobIds = selectedJobs.size > 0 ? [...selectedJobs] : null;
     chrome.runtime.sendMessage({ type: 'RUN_NOW', jobIds }, () => loadStatus());
+  });
+
+  // Resume a sync that stopped early (e.g. login-required) — continues the
+  // preserved remaining queue exactly, does not touch Run Now's selection.
+  document.getElementById('resumeBtn').addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'RESUME_SYNC' }, () => loadStatus());
   });
 
   // Select all / deselect all toggle
