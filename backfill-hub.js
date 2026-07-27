@@ -36,6 +36,24 @@ const REPORT_TYPES = {
     platform: 'flipkart',
     gapJobId: 'fk_returns_download',
   },
+  me_returns: {
+    label:  'Meesho Returns',
+    mode:   'daterange',
+    generic: true,
+    gapJobId: 'me_returns',
+  },
+  me_claims: {
+    label:  'Meesho Support Tickets (Claims)',
+    mode:   'daterange',
+    generic: true,
+    gapJobId: 'me_claims',
+  },
+  me_ads: {
+    label:  'Meesho Ads Cost',
+    mode:   'daterange',
+    generic: true,
+    gapJobId: 'me_ads',
+  },
 };
 
 let stopRequested = false;
@@ -1353,12 +1371,89 @@ async function runFkReturnsDate(date) {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// ─── Generic runner — reuses the daily sync's OWN job logic ────────────────
+// Instead of bespoke DOM automation, this triggers the exact same production
+// job the daily sync runs (RUN_NOW), after setting a runtime date override
+// that every job's date-resolution now checks first (see background.js
+// SET_BACKFILL_OVERRIDE, content/flipkart.js and content/meesho.js
+// _YESTERDAY_OVERRIDE). Works for any single-phase job — no new DOM
+// automation to write or test per report type.
+// ══════════════════════════════════════════════════════════════════════════
+
+function pollUntilSyncDone(timeoutMs = 5 * 60 * 1000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    function check() {
+      chrome.storage.local.get(['syncRunning', 'syncDone', 'syncFailed'], data => {
+        if (!data.syncRunning) {
+          resolve({ syncDone: data.syncDone || [], syncFailed: data.syncFailed || [] });
+        } else if (Date.now() - start >= timeoutMs) {
+          reject(new Error(`Timeout waiting for job to finish (${timeoutMs / 1000}s)`));
+        } else {
+          setTimeout(check, 2000);
+        }
+      });
+    }
+    check();
+  });
+}
+
+function runGenericJobDate(jobId, gapJobId) {
+  return async function(date) {
+    setRow(date, 'running', 'Starting…', '—', `Triggering ${jobId} for ${date}`);
+    log(`${date}: triggering ${jobId} via the daily sync's own job logic`);
+
+    const { syncRunning } = await new Promise(res => chrome.storage.local.get('syncRunning', res));
+    if (syncRunning) {
+      setRow(date, 'error', 'ERROR', '—', 'A sync is already running — wait for it to finish first');
+      log(`${date}: ABORTED — a sync is already running`);
+      return false;
+    }
+
+    try {
+      await bgMessage({ type: 'SET_BACKFILL_OVERRIDE', date });
+      log(`${date}: backfill override set — running ${jobId}`);
+      setRow(date, 'running', 'Running…', '—', `${jobId} in progress`);
+      await bgMessage({ type: 'RUN_NOW', jobIds: [jobId] });
+
+      const { syncDone, syncFailed } = await pollUntilSyncDone();
+      await bgMessage({ type: 'CLEAR_BACKFILL_OVERRIDE' });
+
+      const failure = syncFailed.find(f => f.id === jobId);
+      if (failure) {
+        setRow(date, 'error', 'ERROR', '—', failure.error || 'Job failed');
+        log(`${date}: ERROR — ${failure.error || 'Job failed'}`);
+        return false;
+      }
+      if (!syncDone.includes(jobId)) {
+        setRow(date, 'error', 'ERROR', '—', 'Job did not report success or failure');
+        log(`${date}: ERROR — job finished but reported neither success nor failure`);
+        return false;
+      }
+
+      setRow(date, 'done', 'DONE ✓', '—', `${jobId} uploaded`);
+      log(`${date}: SUCCESS — ${jobId}`);
+      await postBackfillSuccess(gapJobId, date);
+      return true;
+
+    } catch (err) {
+      await bgMessage({ type: 'CLEAR_BACKFILL_OVERRIDE' });
+      setRow(date, 'error', 'ERROR', '—', err.message);
+      log(`${date}: ERROR — ${err.message}`);
+      return false;
+    }
+  };
+}
+
 // ─── Report dispatch ─────────────────────────────────────────────────────────
 
 function runnerFor(reportKey) {
   if (reportKey === 'me_orders')   return runMeOrdersDate;
   if (reportKey === 'me_payments') return runMePaymentsDate;
   if (reportKey === 'fk_returns')  return runFkReturnsDate;
+  const cfg = REPORT_TYPES[reportKey];
+  if (cfg?.generic) return runGenericJobDate(reportKey, cfg.gapJobId);
   throw new Error(`No date-range runner for ${reportKey}`);
 }
 

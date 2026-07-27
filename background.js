@@ -1030,6 +1030,13 @@ async function gcFkAdsTargetDate(jobId) {
 // No-op for any job not in SINGLE_SHOT_GC_JOBS or not enabled — existing
 // behavior for every other job is completely unaffected.
 async function recordSingleShotGapCatchup(jobId, success, errMsg = null) {
+  // A manual backfill run is explicitly NOT a missed automatic run — gap-catchup
+  // tracks recent dates owed because the daily sync failed, and a backfill of an
+  // arbitrary historical date has nothing to do with that. Recording it here
+  // (even with the override date substituted in) risks adding a spurious pending
+  // item or misdating an existing one, so skip gap-catchup bookkeeping entirely
+  // whenever a backfill is what actually ran.
+  if (_YESTERDAY_OVERRIDE_BG != null) return;
   if (!SINGLE_SHOT_GC_JOBS.includes(jobId)) return;
   if (!(await gcIsEnabledForBg(jobId))) return;
 
