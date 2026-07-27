@@ -8,9 +8,11 @@ const ALARM_NAME     = 'rumee-daily-sync';
 const KEEPALIVE_ALARM = 'rumee_keepalive';   // wakes SW every 2 min → watchdog can fire on time
 
 // ── Date helpers (mirrored from content/flipkart.js) ─────────────────────────
-// Set to a date string (e.g. '2026-06-01') to test a specific date, or null for real yesterday.
-// MUST stay in sync with _YESTERDAY_OVERRIDE in content/flipkart.js.
-const _YESTERDAY_OVERRIDE_BG = null;
+// Was a hardcoded const meant for manual dev testing (hand-edit + reload).
+// Now also settable at runtime via SET_BACKFILL_OVERRIDE (backfill-hub.js) —
+// see that handler below. Still defaults to null (real yesterday) whenever
+// nothing has set it, so the daily sync is completely unaffected.
+let _YESTERDAY_OVERRIDE_BG = null;
 function yesterdayISOBg() {
   if (_YESTERDAY_OVERRIDE_BG != null) return _YESTERDAY_OVERRIDE_BG;
   return istYesterday();
@@ -504,6 +506,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Backfill hub: set/clear the runtime date override before/after RUN_NOW.
+  // msg.date: 'YYYY-MM-DD'. Every job's date-resolution (yesterdayISOBg,
+  // gcFkAdsTargetDate, content/flipkart.js's and content/meesho.js's own
+  // yesterdayISO/gcSingleShotTargetDate) checks this FIRST, ahead of both
+  // "real yesterday" and gap-catchup's own pending-date pick. Defaults to
+  // null (unset) — the daily sync never sets this, so its behavior is
+  // completely unaffected unless a backfill run is actively in progress.
+  if (msg.type === 'SET_BACKFILL_OVERRIDE') {
+    _YESTERDAY_OVERRIDE_BG = msg.date || null;
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === 'CLEAR_BACKFILL_OVERRIDE') {
+    _YESTERDAY_OVERRIDE_BG = null;
+    sendResponse({ ok: true });
+    return true;
+  }
+
   // Manual trigger to rebuild the Download Manifest Sheet's history for a date
   // range (repair tool — see rebuildManifestHistory). msg.fromDate/toDate: 'YYYY-MM-DD'.
   if (msg.type === 'REBUILD_MANIFEST_HISTORY') {
@@ -774,7 +794,13 @@ async function handleContentReady(tabId) {
   if (!syncRunning || tabId !== currentTabId) return null;
 
   const job = JOBS.find(j => j.id === currentJobId);
-  return job || null;
+  if (!job) return null;
+  // Propagate an active backfill override to the content script via a NEW
+  // object — never mutate the shared JOBS entry itself (JOBS.find() returns
+  // the SAME object reference every run; setting a property directly on it
+  // would leak the override into every future real daily-sync run of this
+  // same job until the process restarts).
+  return _YESTERDAY_OVERRIDE_BG != null ? { ...job, backfillDate: _YESTERDAY_OVERRIDE_BG } : job;
 }
 
 /**
@@ -990,6 +1016,10 @@ async function gcIsEnabledForBg(jobId) {
 // this job's NEXT navigation" — same pending-lookup logic as the
 // content-script version (gcSingleShotTargetDate in meesho.js).
 async function gcFkAdsTargetDate(jobId) {
+  // A backfill run always wins over gap-catchup's own pending-date pick —
+  // otherwise a backfill for date X could silently target gap-catchup's own
+  // stuck date instead, whenever gap-catchup happens to have one pending.
+  if (_YESTERDAY_OVERRIDE_BG != null) return _YESTERDAY_OVERRIDE_BG;
   if (!(await gcIsEnabledForBg(jobId))) return yesterdayISOBg();
   const { gapCatchupPending = {} } = await chrome.storage.local.get(['gapCatchupPending']);
   const oldest = gcGetOldestPending(gapCatchupPending, jobId);

@@ -94,6 +94,13 @@ const HANDLERS = {
 // module-level __rumeeDownload listener below.
 let _currentJob = null;
 
+// Set at bootstrap from job.backfillDate (see entry-point IIFE below) —
+// background.js's _YESTERDAY_OVERRIDE_BG, set via SET_BACKFILL_OVERRIDE,
+// flows into the job object handleContentReady() returns. Mirrors the same
+// mechanism in content/flipkart.js. Defaults to null (real yesterday) for
+// every normal daily-sync run.
+let _YESTERDAY_OVERRIDE = null;
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 (async () => {
@@ -136,6 +143,7 @@ let _currentJob = null;
   }
 
   _currentJob = job; // expose to the module-level __rumeeDownload listener
+  _YESTERDAY_OVERRIDE = job.backfillDate || null; // backfill hub: target a specific past date instead of real yesterday
   console.log(`[Rumee/ME] ▶ job: ${job.id} | url: ${window.location.href}`);
 
   // ── Dismiss any ad / promo / cookie popup that blocks the sidebar ──────────
@@ -510,7 +518,7 @@ async function clickAndWait(el, ms = 800) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function todayISO()        { return istToday(); }
-function yesterdayISO()    { return daysAgoISO(1); }
+function yesterdayISO()    { return (_YESTERDAY_OVERRIDE != null) ? _YESTERDAY_OVERRIDE : daysAgoISO(1); }
 function daysAgoISO(n)     { return istDaysAgo(n); }
 function addDays(iso, n)   { return istAddDays(iso, n); }
 
@@ -529,6 +537,10 @@ async function gcIsEnabledFor(jobId) {
 // own normal (yesterday's) data. No-op — always plain yesterday — unless
 // gap-catchup is enabled for this job.
 async function gcSingleShotTargetDate(jobId) {
+  // A backfill run always wins over gap-catchup's own pending-date pick —
+  // otherwise a backfill for date X could silently target gap-catchup's own
+  // stuck date instead, whenever gap-catchup happens to have one pending.
+  if (_YESTERDAY_OVERRIDE != null) return _YESTERDAY_OVERRIDE;
   if (!(await gcIsEnabledFor(jobId))) return yesterdayISO();
   const { gapCatchupPending = {} } = await getStorage(['gapCatchupPending']);
   const oldest = gcGetOldestPending(gapCatchupPending, jobId);

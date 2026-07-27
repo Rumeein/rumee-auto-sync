@@ -109,6 +109,7 @@ const REPORTS_CENTRE_CFG = {
   }
 
   _currentJob = job; // expose to the module-level __rumeeDownload listener
+  _YESTERDAY_OVERRIDE = job.backfillDate || null; // backfill hub: target a specific past date instead of real yesterday
   console.log(`[Rumee/FK] â–¶ job: ${job.id} | url: ${window.location.href}`);
 
   const handler = HANDLERS_FK[job.id];
@@ -391,8 +392,12 @@ function makeDatedFilename(job, fromDate, toDate) {
   const dateStr = (toDate && toDate !== fromDate) ? `${fromDate}_${toDate}` : fromDate;
   return `${base}_${dateStr}${ext}`;
 }
-// Set to a date string (e.g. '2026-06-01') to test a specific date, or null for real yesterday
-const _YESTERDAY_OVERRIDE = null;
+// Was a hardcoded const for manual dev testing. Now also set at runtime from
+// job.backfillDate (see the entry-point IIFE below) — background.js's
+// _YESTERDAY_OVERRIDE_BG, set via SET_BACKFILL_OVERRIDE, flows into the job
+// object handleContentReady() returns. Still defaults to null (real
+// yesterday) for every normal daily-sync run.
+let _YESTERDAY_OVERRIDE = null;
 function yesterdayISO() { return (_YESTERDAY_OVERRIDE != null) ? _YESTERDAY_OVERRIDE : daysAgoISO(1); }
 function addDays(isoDate, n) { return istAddDays(isoDate, n); }
 
