@@ -495,8 +495,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   // Manual trigger for the download-manifest verification (testing / on demand).
+  // msg.dataDate (optional, 'YYYY-MM-DD'): verify a specific date instead of
+  // yesterday — used by the backfill hub to upsert the manifest row for a
+  // date it just backfilled, without touching any other row (content-based
+  // upsert keyed by Data Date + File Name — see verifyAndLogManifest above).
   if (msg.type === 'VERIFY_NOW') {
-    verifyAndLogManifest().then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
+    verifyAndLogManifest(msg.dataDate).then(r => sendResponse(r)).catch(e => sendResponse({ error: e.message }));
     return true;
   }
 
@@ -1897,11 +1901,10 @@ async function _checkManifestSlotForDate(token, slot, dataDate) {
   return (await res.json()).files || [];
 }
 
-async function verifyAndLogManifest() {
+async function verifyAndLogManifest(dataDate = yesterdayISOBg()) {
   const token = await getDriveToken(true);
 
-  const runDate  = todayStr();
-  const dataDate = yesterdayISOBg();
+  const runDate = todayStr();
 
   // Each result → { fileName, status }. Single/append slots use the stable slot
   // LABEL as File Name (so a Missing row flips to Verified in place on recheck);
