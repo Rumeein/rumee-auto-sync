@@ -36,6 +36,31 @@ async function getEffectiveStartUrl(job) {
   return job.startUrl;
 }
 
+/**
+ * Opens `url` in a dedicated, unfocused Rumee automation window instead of a
+ * background tab in the user's current window. Chrome only throttles a tab's
+ * timers when a different tab is selected in its window, or that window is
+ * minimized (https://developer.chrome.com/blog/timer-throttling-in-chrome-88)
+ * — OS focus isn't the trigger. Keeping the job tab as the sole/active tab of
+ * its own non-minimized window avoids that throttling without stealing the
+ * user's screen focus. The window persists (its ID is stored) and is reused
+ * across jobs/sync runs; if it's been closed, a new one is created.
+ */
+async function getOrCreateRumeeTab(url) {
+  const { rumeeWindowId } = await chrome.storage.local.get('rumeeWindowId');
+  if (rumeeWindowId) {
+    try {
+      await chrome.windows.get(rumeeWindowId);
+      return await chrome.tabs.create({ url, windowId: rumeeWindowId, active: true });
+    } catch (_) {
+      // Window no longer exists (closed manually, etc.) — fall through to recreate.
+    }
+  }
+  const win = await chrome.windows.create({ url, focused: false, state: 'normal', width: 1000, height: 700 });
+  await chrome.storage.local.set({ rumeeWindowId: win.id });
+  return win.tabs[0];
+}
+
 // Serial queue for LOG_DEBUG writes — prevents concurrent chrome.storage overwrites
 // that would cause log entries to be silently dropped.
 let _logQueue = Promise.resolve();
@@ -336,10 +361,11 @@ async function openTabForJob(job) {
       borrowed = true;
     }
   } else {
-    // No panel open — open a new background tab
+    // No panel open — open a tab in the dedicated Rumee automation window
+    // (see getOrCreateRumeeTab — avoids Chrome's background-tab timer throttling).
     const effectiveUrl = await getEffectiveStartUrl(job);
-    console.log(`[Rumee] No ${domain} tab found — opening new background tab for ${job.label} → ${effectiveUrl.slice(0, 100)}`);
-    tab     = await chrome.tabs.create({ url: effectiveUrl, active: false });
+    console.log(`[Rumee] No ${domain} tab found — opening tab in Rumee automation window for ${job.label} → ${effectiveUrl.slice(0, 100)}`);
+    tab     = await getOrCreateRumeeTab(effectiveUrl);
     borrowed = false;
   }
 
