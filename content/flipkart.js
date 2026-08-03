@@ -92,10 +92,25 @@ const REPORTS_CENTRE_CFG = {
 
   // Check for login wall â€” bot-detected background tabs get redirected here
   const isLoginPage = () => {
-    const url = window.location.href;
+    const url   = window.location.href;
+    const title = document.title.toLowerCase();
     return url.includes('/login') || url.includes('/signin')
-      || document.title.toLowerCase().includes('login')
-      || document.title.toLowerCase().includes('sign in');
+      || title.includes('login')
+      || title.includes('sign in')
+      // An expired Flipkart session is NOT sent to a login page. FK bounces the
+      // tab to its PUBLIC MARKETING page, which matches none of the checks above
+      // â€” it advertises signing UP. Observed live 2026-07-29 and 2026-08-03:
+      //   https://seller.flipkart.com/?referral_url=%2Findex.html%3F%23dashboard%2Fads%2F...
+      //   title "Become an Online Seller in India | Flipkart Seller Hub"
+      // Without these two checks the script proceeds as if authenticated and every
+      // element lookup fails, surfacing an expired login as "Request New Report /
+      // All Returns / Custom Dates button not found" and letting gap-catchup retry
+      // a session problem for days. Only these two positively-observed signatures
+      // are matched â€” deliberately not a broad "dashboard shell missing" test,
+      // which would false-positive during normal early page load.
+      // referral_url is FK's own bounce marker; the extension never adds it.
+      || /[?&]referral_url=/.test(url)
+      || title.includes('become an online seller');
   };
 
   if (isLoginPage()) {
