@@ -1179,9 +1179,25 @@ async function handlePayments(job) {
 
   // ── Click "Payments to Date" option ──────────────────────────────────────
   // Dropdown options are <P> elements (Meesho custom dropdown, not native <select>).
+  // Meesho later added a "Payments over time" chart whose LEGEND carries the exact
+  // same label — and it sits EARLIER in the DOM, so a plain text match returned the
+  // legend. Clicking a chart legend does nothing, the menu closes, no modal opens,
+  // and the job then died two steps later with "final Download button not found
+  // after 5 attempts" — which is why that error was so misleading: the real failure
+  // is here. Confirmed live 2026-08-03: exactly 2 visible matches — the legend at
+  // y=684 (the one .find() was picking) and the real menu item at y=195.
+  // Disambiguate by requiring the match to sit inside the open download menu,
+  // identified by that menu's own first option, "GST Report".
+  const inDownloadMenu = (el) => {
+    for (let a = el, k = 0; a && k < 6; a = a.parentElement, k++) {
+      if (/GST Report/.test(a.textContent || '')) return true;
+    }
+    return false;
+  };
   const paymentsToDateOpt = Array.from(document.querySelectorAll('p, li, [role="option"], button'))
-    .find(el => el.offsetParent && el.textContent.trim() === 'Payments to Date');
-  if (!paymentsToDateOpt) throw new Error('ME_PAYMENTS: "Payments to Date" option not found');
+    .filter(el => el.offsetParent && el.textContent.trim() === 'Payments to Date')
+    .find(inDownloadMenu);
+  if (!paymentsToDateOpt) throw new Error('ME_PAYMENTS: "Payments to Date" option not found in download menu');
   await clickAndWait(paymentsToDateOpt, 1500);
 
   // ── Select "Custom Date Range" radio ─────────────────────────────────────
