@@ -2018,11 +2018,21 @@ async function _handleFkAdsOverall(job) {
   }
   await _log(`fk_ads_overall: input found â€” placeholder="${input.placeholder}"`);
 
+  // Capture the pristine filename template BEFORE the loop. Each iteration below
+  // assigns the per-campaign name onto _currentJob.filename (which is the same
+  // object as `job`) so the blob relay picks it up — meaning a later iteration
+  // reading job.filename would build its name on top of the previous campaign's
+  // already-dated name and compound. Seen live 2026-08-03 with 2 live campaigns:
+  // campaign 2 uploaded as flipkart_ads_overall_2026-08-02_0P5FADU79046_2026-08-02_863R3CQQCKQW.csv
+  // and campaign 1's own file never landed.
+  const _baseFilename = job.filename;
+
   for (let i = 0; i < activeCampaignIds.length; i++) {
     const campId = activeCampaignIds[i];
     const isLast = (i === activeCampaignIds.length - 1);
     const safeName = campId.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 30);
-    const filename = makeDatedFilename(job, _fkAdsCurrentTargetDate(), _fkAdsCurrentTargetDate())
+    const filename = makeDatedFilename({ ...job, filename: _baseFilename },
+                                       _fkAdsCurrentTargetDate(), _fkAdsCurrentTargetDate())
       .replace('.csv', activeCampaignIds.length > 1 ? `_${safeName}.csv` : '.csv');
 
     await _log(`Overall (${i + 1}/${activeCampaignIds.length}): "${campId}" â†’ "${filename}"`);
