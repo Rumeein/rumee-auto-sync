@@ -1148,9 +1148,24 @@ async function flushLogToDrive() {
   const LOG_FILENAME = 'rumee_sync_log.csv';
   const HEADER       = 'ts,jobId,level,msg\n';
 
-  const { rumeeLog = [], syncStarted } = await chrome.storage.local.get(['rumeeLog', 'syncStarted']);
-  const cutoff = syncStarted || 0;
-  const entries = rumeeLog.filter(e => new Date(e.ts).getTime() >= cutoff);
+  // Flush everything newer than the last SUCCESSFUL flush — deliberately not
+  // everything newer than syncStarted. startSync() resets syncStarted on every
+  // sync start, including a run resumed after a login-required pause and every
+  // targeted recheck mini-sync. Filtering on it silently discarded the earlier
+  // part of the same day's run before it ever reached Drive — on 2026-08-03 the
+  // whole Flipkart head of the queue (fk_orders/fk_returns/fk_payments/
+  // fk_views_request) failed and left zero evidence behind because of this.
+  const { rumeeLog = [], syncStarted, lastFlushedTs } =
+    await chrome.storage.local.get(['rumeeLog', 'syncStarted', 'lastFlushedTs']);
+
+  // First flush after this fix: fall back to the old syncStarted cutoff so the
+  // still-buffered entries already present in the Drive file aren't re-appended.
+  // (-1 keeps the old boundary inclusive now that the filter below is strict.)
+  const cutoff = lastFlushedTs != null
+    ? lastFlushedTs
+    : (syncStarted ? syncStarted - 1 : -1);
+
+  const entries = rumeeLog.filter(e => new Date(e.ts).getTime() > cutoff);
   if (entries.length === 0) return;
 
   const csvEscape = s => `"${String(s ?? '').replace(/"/g, '""')}"`;
@@ -1167,6 +1182,11 @@ async function flushLogToDrive() {
   } else {
     await uploadToDrive(new TextEncoder().encode(HEADER + csvRows).buffer, LOG_FILENAME, folderId, 'text/csv');
   }
+
+  // Advance the marker only after the write succeeded — a failed flush leaves it
+  // untouched so the same entries are retried next time instead of being lost.
+  const newest = entries.reduce((max, e) => Math.max(max, new Date(e.ts).getTime()), cutoff);
+  await chrome.storage.local.set({ lastFlushedTs: newest });
 
   logInfo('system', `✓ Log flushed to Drive (${entries.length} entries)`);
 }
