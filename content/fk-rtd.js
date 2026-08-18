@@ -23,6 +23,7 @@ window.__rumeeRtdInjected = true;
 const RTD_URL = 'https://seller.flipkart.com/index.html#dashboard/active-orders?query=%7B%22activeShipmentTile%22%3A%22pendingToPack%22%7D';
 const STATE_KEY = 'fkRtdBot';
 const LOG_KEY   = 'fkRtdLog';
+const UI_KEY    = 'fkRtdUi';   // panel position + collapsed state, so it stays put after a reload
 
 // Pacing (milliseconds). Every wait is randomised around these — never a fixed beat.
 const PACE = {
@@ -80,7 +81,14 @@ function rowContextFor(el) {
     node = node.parentElement;
     if (!node) break;
     const t = txt(node);
-    if (/SKU ID|FSN|Order ID/i.test(t) && t.length > 40) return { node, text: t };
+    if (/SKU ID|FSN|Order ID/i.test(t) && t.length > 40) {
+      // The toolbar's bulk Mark RTD button has no row of its own, so walking up
+      // from it eventually lands on a container holding the WHOLE table. Anything
+      // covering more than one order is not a row — reject it outright (an outer
+      // container can only get bigger, so there is no point walking further).
+      if ((t.match(/SKU ID/gi) || []).length > 1 || t.length > 600) return null;
+      return { node, text: t };
+    }
   }
   return null;
 }
@@ -133,7 +141,16 @@ async function log(line) {
   const stamp = new Date().toLocaleTimeString('en-IN', { hour12: false });
   const entry = stamp + '  ' + line;
   console.log('[Rumee/RTD]', line);
-  const store = (await chrome.storage.local.get(LOG_KEY))[LOG_KEY] || [];
+  // After the extension is reloaded, the copy of this script already running in
+  // an open tab is orphaned — every chrome.* call throws and the buttons look
+  // dead. Say so instead of failing silently.
+  let store;
+  try {
+    store = (await chrome.storage.local.get(LOG_KEY))[LOG_KEY] || [];
+  } catch (e) {
+    if (logBox) logBox.textContent = 'Extension was reloaded — refresh this page (F5) to use the panel.';
+    return;
+  }
   store.push(entry);
   while (store.length > 120) store.shift();
   await chrome.storage.local.set({ [LOG_KEY]: store });
@@ -146,10 +163,15 @@ function buildPanel() {
   panel.id = '__rumeeRtdPanel';
   panel.innerHTML = [
     '<style>',
-    '#__rumeeRtdPanel{position:fixed;right:16px;bottom:16px;width:330px;z-index:2147483647;',
+    // Default bottom-LEFT: the Mark RTD buttons live on the right of the table,
+    // and the panel must never sit on top of the thing it is clicking.
+    '#__rumeeRtdPanel{position:fixed;left:16px;bottom:16px;width:330px;z-index:2147483647;',
     'background:#14161a;color:#e8eaed;font:12px/1.45 system-ui,Segoe UI,Arial;border-radius:10px;',
     'box-shadow:0 8px 28px rgba(0,0,0,.45);overflow:hidden}',
-    '#__rumeeRtdPanel h4{margin:0;padding:9px 12px;background:#1f6feb;font-size:13px;font-weight:600}',
+    '#__rumeeRtdPanel h4{margin:0;padding:9px 12px;background:#1f6feb;font-size:13px;font-weight:600;',
+    'cursor:move;display:flex;align-items:center;justify-content:space-between;user-select:none}',
+    '#__rumeeRtdPanel #__rtdToggle{flex:0 0 auto;width:24px;padding:1px 0;background:rgba(0,0,0,.25);',
+    'font-size:14px;line-height:1.2}',
     '#__rumeeRtdPanel .bd{padding:10px 12px}',
     '#__rumeeRtdPanel .row{display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap}',
     '#__rumeeRtdPanel button{flex:1;padding:7px 8px;border:0;border-radius:6px;cursor:pointer;',
@@ -164,7 +186,7 @@ function buildPanel() {
     'padding:7px;font:11px/1.4 Consolas,monospace;white-space:pre-wrap;color:#adbac7}',
     '#__rumeeRtdPanel label{color:#9fb0c0}',
     '</style>',
-    '<h4>Rumee — Mark RTD helper</h4>',
+    '<h4><span>Rumee — Mark RTD helper</span><button id="__rtdToggle" title="Collapse">–</button></h4>',
     '<div class="bd">',
     '  <div class="stat" id="__rtdStat">Idle</div>',
     '  <div class="row"><label><input type="checkbox" id="__rtdDry" checked> Dry run (no clicks)</label></div>',
@@ -180,6 +202,61 @@ function buildPanel() {
   document.body.appendChild(panel);
   logBox   = panel.querySelector('#__rtdLog');
   statLine = panel.querySelector('#__rtdStat');
+
+  // ── collapse / expand ──
+  const body   = panel.querySelector('.bd');
+  const toggle = panel.querySelector('#__rtdToggle');
+  const applyCollapsed = c => {
+    body.style.display = c ? 'none' : '';
+    toggle.textContent = c ? '+' : '–';
+    toggle.title       = c ? 'Expand' : 'Collapse';
+  };
+  toggle.onclick = async e => {
+    e.stopPropagation();                       // do not start a drag
+    const ui = (await chrome.storage.local.get(UI_KEY))[UI_KEY] || {};
+    ui.collapsed = body.style.display !== 'none';
+    applyCollapsed(ui.collapsed);
+    await chrome.storage.local.set({ [UI_KEY]: ui });
+  };
+
+  // ── drag by the blue header ──
+  const head = panel.querySelector('h4');
+  let drag = null;
+  head.addEventListener('mousedown', e => {
+    if (e.target === toggle) return;
+    const r = panel.getBoundingClientRect();
+    drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!drag) return;
+    const left = Math.max(0, Math.min(window.innerWidth  - 80, e.clientX - drag.dx));
+    const top  = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - drag.dy));
+    panel.style.left = left + 'px';
+    panel.style.top  = top + 'px';
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  });
+  document.addEventListener('mouseup', async () => {
+    if (!drag) return;
+    drag = null;
+    const ui = (await chrome.storage.local.get(UI_KEY))[UI_KEY] || {};
+    ui.left = parseInt(panel.style.left, 10);
+    ui.top  = parseInt(panel.style.top, 10);
+    await chrome.storage.local.set({ [UI_KEY]: ui });
+  });
+
+  // Put it back where it was left last time.
+  chrome.storage.local.get(UI_KEY).then(res => {
+    const ui = res[UI_KEY] || {};
+    if (typeof ui.left === 'number' && typeof ui.top === 'number') {
+      panel.style.left = ui.left + 'px';
+      panel.style.top  = ui.top + 'px';
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    }
+    applyCollapsed(!!ui.collapsed);
+  });
 
   panel.querySelector('#__rtdStart').onclick = async () => {
     const dryRun = panel.querySelector('#__rtdDry').checked;
