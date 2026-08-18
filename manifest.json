@@ -52,6 +52,11 @@
       "matches": ["https://seller.flipkart.com/*"],
       "js": ["ist-time.js", "gap-catchup.js", "report-confirm-fallback.js", "config.js", "content/flipkart.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://seller.flipkart.com/*"],
+      "js": ["content/fk-rtd.js"],
+      "run_at": "document_idle"
     }
   ],
 
