@@ -62,22 +62,19 @@ const MODES = {
         .filter(Boolean);
     },
     async act(pick) {
-      // Single click only, and confirm it actually opened — the header is a
-      // toggle, so a second click would close it again.
-      await humanClick(pick.el, { single: true });
-      let open = await waitFor(() => pick.el.getAttribute('aria-expanded') === 'true', 3000);
-      if (!open) {
-        await humanClick(pick.el, { single: true });
-        open = await waitFor(() => pick.el.getAttribute('aria-expanded') === 'true', 3000);
-      }
-      if (!open) { await log('  row panel would not open'); return false; }
       const scope = pick.el.closest('[data-testid^="accordion-component"]')
                  || pick.el.parentElement;
-      const btn = await waitFor(() => [...scope.querySelectorAll('button')].find(b =>
-        /^accept all \d+ orders?$/i.test(txt(b)) && isVisible(b) && !isDisabled(b)), 8000);
-      if (!btn) { await log('  panel did not offer "Accept All ..." — skipping'); return false; }
+      const findAcceptAll = () => [...scope.querySelectorAll('button')].find(b =>
+        /^accept all \d+ orders?$/i.test(txt(b)) && isVisible(b) && !isDisabled(b));
+
+      // One native click opens the row. aria-expanded is not trustworthy here —
+      // it stayed "false" on a panel that had visibly opened — so the arrival of
+      // the "Accept All ..." button is the real signal.
+      await humanClick(pick.el, { native: true });
+      const btn = await waitFor(findAcceptAll, 8000);
+      if (!btn) { await log('  row panel did not open'); return false; }
       await log('  panel open → "' + txt(btn) + '"');
-      await humanClick(btn);
+      await humanClick(btn, { native: true });
       return true;
     },
   },
@@ -523,6 +520,10 @@ async function humanClick(el, opts) {
   fire(el, 'pointerover', x, y); fire(el, 'mouseover', x, y);
   fire(el, 'mousemove', x + rand(-3, 3), y + rand(-2, 2));
   await sleep(rand(140, 480));                        // hover dwell
+  // opts.native — hover like a person, then hand over to the element's own click.
+  // The Accept row accordion ignores a synthetic mouse sequence completely
+  // (aria-expanded never flips), but responds to a native click every time.
+  if (opts && opts.native) { el.click(); return; }
   fire(el, 'pointerdown', x, y); fire(el, 'mousedown', x, y);
   await sleep(rand(55, 165));                         // press duration
   fire(el, 'pointerup', x, y); fire(el, 'mouseup', x, y);
