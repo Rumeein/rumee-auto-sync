@@ -508,10 +508,33 @@ function fire(el, type, x, y) {
   }));
 }
 
+// Proved live 2026-08-19: when the panel sits over the row being clicked, the
+// click simply does not land — the Accept row would not open at all until the
+// panel was hidden, and then it opened in half a second. So get out of the way
+// for the duration of any click that overlaps it, then come straight back.
+function movePanelAsideFor(el) {
+  if (!panel || !el || !el.getBoundingClientRect) return () => {};
+  const a = panel.getBoundingClientRect(), b = el.getBoundingClientRect();
+  const overlaps = a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  if (!overlaps) return () => {};
+  const was = panel.style.visibility;
+  panel.style.visibility = 'hidden';
+  return () => { panel.style.visibility = was; };
+}
+
 // opts.single — send exactly one click. The `el.click()` fallback below is a
 // second click as far as a toggle is concerned: on the Accept accordion it
 // opened the panel and immediately shut it again, so nothing could be accepted.
 async function humanClick(el, opts) {
+  const restorePanel = movePanelAsideFor(el);
+  try {
+    return await clickSequence(el, opts);
+  } finally {
+    restorePanel();
+  }
+}
+
+async function clickSequence(el, opts) {
   el.scrollIntoView({ block: 'center', behavior: 'smooth' });
   await sleep(rand(400, 1100));                       // settle + look at the row
   const r = el.getBoundingClientRect();
