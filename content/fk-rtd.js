@@ -442,20 +442,34 @@ function scrollables() {
 }
 
 async function loadWholeList(mode, onProgress) {
+  // The tab counter is the target: once that many rows are loaded, stop.
+  const target = readPendingCount(mode);
   let seen = actionRowButtons(mode).length;
-  for (let i = 0; i < 30; i++) {
-    window.scrollTo({ top: document.body.scrollHeight });
-    for (const el of scrollables()) el.scrollTop = el.scrollHeight;
-    await sleep(rand(700, 1300));
-    const now = actionRowButtons(mode).length;
-    if (onProgress) onProgress(now);
-    if (now <= seen) break;                    // nothing new loaded — that is the end
-    seen = now;
+  let idle = 0;                                // passes in a row that added nothing
+  let rows = actionRowButtons(mode);
+
+  // One screen at a time, not a single jump to the bottom — Flipkart loads the
+  // next batch only as the end of the current one comes into view, and the fetch
+  // takes longer than one short wait (an earlier version gave up after 20 of 51).
+  for (let i = 0; i < 60 && idle < 3; i++) {
+    for (const el of scrollables()) {
+      el.scrollTop = Math.min(el.scrollHeight, el.scrollTop + Math.max(300, el.clientHeight * 0.85));
+    }
+    window.scrollBy(0, 400);
+    await sleep(rand(900, 1500));
+    rows = actionRowButtons(mode);
+    if (onProgress) onProgress(rows.length);
+    if (target && rows.length >= target) break;
+    if (rows.length > seen) { seen = rows.length; idle = 0; } else idle++;
   }
-  window.scrollTo({ top: 0 });
+
+  // Snapshot taken above, BEFORE going back to the top, so nothing is lost if the
+  // page drops off-screen rows. Then return to the top so a run starts at row one.
   for (const el of scrollables()) el.scrollTop = 0;
+  window.scrollTo({ top: 0 });
   await sleep(600);
-  return actionRowButtons(mode);
+  const afterScrollUp = actionRowButtons(mode);
+  return afterScrollUp.length >= rows.length ? afterScrollUp : rows;
 }
 
 async function scanSkus(mode) {
