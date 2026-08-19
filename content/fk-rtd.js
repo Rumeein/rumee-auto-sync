@@ -22,6 +22,7 @@ window.__rumeeRtdInjected = true;
 
 'use strict';
 
+const BUILD      = '2026-08-19c';  // shown in the log so it is obvious which build a tab is running
 const STATE_KEY  = 'fkRtdBot';
 const LOG_KEY    = 'fkRtdLog';
 const UI_KEY     = 'fkRtdUi';      // panel position + collapsed state
@@ -391,7 +392,7 @@ function buildPanel(mode) {
       mode: mode.id, running: true, dryRun, limit,
       done: 0, failed: 0, reloads: 0, startedAt: Date.now(),
     });
-    await log('START — ' + mode.verb + ', ' + (dryRun ? 'DRY RUN' : 'LIVE') + ', limit ' + limit
+    await log('START (build ' + BUILD + ') — ' + mode.verb + ', ' + (dryRun ? 'DRY RUN' : 'LIVE') + ', limit ' + limit
       + (mode.skuFilter ? (picked.length ? ', SKUs: ' + picked.join(', ') : ', all SKUs') : ''));
     runLoop(mode);
   };
@@ -535,6 +536,17 @@ async function humanClick(el, opts) {
 }
 
 async function clickSequence(el, opts) {
+  // opts.native — exactly the sequence proved to work by hand on the Accept row:
+  // instant scroll into view, a pause, then the element's own click and nothing
+  // else. Adding smooth scrolling or synthetic hover events on top of it stopped
+  // the row from opening, so nothing else belongs in this branch.
+  if (opts && opts.native) {
+    el.scrollIntoView({ block: 'center' });
+    await sleep(rand(500, 1200));
+    el.click();
+    return;
+  }
+
   el.scrollIntoView({ block: 'center', behavior: 'smooth' });
   await sleep(rand(400, 1100));                       // settle + look at the row
   const r = el.getBoundingClientRect();
@@ -543,10 +555,6 @@ async function clickSequence(el, opts) {
   fire(el, 'pointerover', x, y); fire(el, 'mouseover', x, y);
   fire(el, 'mousemove', x + rand(-3, 3), y + rand(-2, 2));
   await sleep(rand(140, 480));                        // hover dwell
-  // opts.native — hover like a person, then hand over to the element's own click.
-  // The Accept row accordion ignores a synthetic mouse sequence completely
-  // (aria-expanded never flips), but responds to a native click every time.
-  if (opts && opts.native) { el.click(); return; }
   fire(el, 'pointerdown', x, y); fire(el, 'mousedown', x, y);
   await sleep(rand(55, 165));                         // press duration
   fire(el, 'pointerup', x, y); fire(el, 'mouseup', x, y);
