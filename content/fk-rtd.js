@@ -26,7 +26,7 @@ window.__rumeeRtdInjected = true;
 
 'use strict';
 
-const BUILD      = '2026-08-19f';  // shown in the log so it is obvious which build a tab is running
+const BUILD      = '2026-08-19g';  // shown in the log so it is obvious which build a tab is running
 const STATE_KEY  = 'fkRtdBot';
 const LOG_KEY    = 'fkRtdLog';
 const UI_KEY     = 'fkRtdUi';      // panel position + collapsed state
@@ -68,12 +68,21 @@ const MODES = {
       // is what puts the Save-As box on screen) and re-downloads the same URL into
       // the Downloads folder with no prompt.
       await chrome.runtime.sendMessage({ type: 'LABEL_ARM' });
+      const startedAt = Date.now();
       await humanClick(pick.el);
 
+      // If Chrome asks where to save, the run simply waits here until the file is
+      // actually on disk — no clicking ahead to the next order in the meantime.
+      let told = false;
       const res = await waitFor(async () => {
         const r = (await chrome.storage.local.get('_labelDownloadResult'))._labelDownloadResult;
-        return r || null;
-      }, 30000);
+        if (r) return r;
+        if (!told && Date.now() - startedAt > 6000) {
+          told = true;
+          await log('  waiting for you to save this label — paused until then');
+        }
+        return null;
+      }, 610000);
 
       if (!res) {
         await chrome.runtime.sendMessage({ type: 'LABEL_DISARM' });

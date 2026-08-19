@@ -1614,8 +1614,12 @@ function reportLabelResult(result) {
 }
 
 // Waits for the re-issued download to finish, then reports where it landed.
+// Waits as long as it takes. When "Ask where to save each file" is on, Chrome
+// puts a Save-As box on screen and the file only exists once the user saves it —
+// so this keeps waiting, which in turn holds the whole run still (the panel awaits
+// this result before touching the next order). Ten minutes is the giving-up point.
 function trackLabelDownload(id) {
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + 600000;
   const poll = () => {
     chrome.downloads.search({ id }, (items) => {
       const it = items && items[0];
@@ -1628,7 +1632,7 @@ function trackLabelDownload(id) {
         return;
       }
       if (Date.now() > deadline) {
-        reportLabelResult({ ok: false, reason: 'no file after 30s — a Save-As box is probably waiting on screen' });
+        reportLabelResult({ ok: false, reason: 'still not saved after 10 minutes — giving up on this one' });
         return;
       }
       setTimeout(poll, 700);
