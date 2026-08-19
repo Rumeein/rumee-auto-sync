@@ -429,52 +429,45 @@ async function paint(mode, extra) {
     : 'Idle' + tail;
 }
 
-// ── SKU scan ────────────────────────────────────────────────────────────────
-// Flipkart renders the order list lazily, so a plain count only sees what is
-// near the viewport. Scroll every scrollable container to the bottom, repeatedly,
-// until no new rows appear — then the SKU counts are the real totals.
-function scrollables() {
-  return [...document.querySelectorAll('div, main, section')].filter(el => {
-    if (el.scrollHeight <= el.clientHeight + 60) return false;
-    const o = getComputedStyle(el).overflowY;
-    return o === 'auto' || o === 'scroll';
-  });
+// ── pagination ──────────────────────────────────────────────────────────────
+// The list is paged, not endlessly scrolled: 20 rows per page with real page
+// buttons underneath (data-testid page-1, page-2, ..., plus next/prev).
+const pageButtons = () => [...document.querySelectorAll('[data-testid^="page-"]')]
+  .filter(b => /^\d+$/.test(txt(b)));
+
+// Clicks page number `i` (0-based) and waits for its rows to render.
+async function gotoPage(mode, i) {
+  const btns = pageButtons();
+  if (!btns[i]) return false;
+  await humanClick(btns[i]);
+  await sleep(rand(900, 1600));
+  await waitFor(() => actionRowButtons(mode).length > 0, 15000);
+  return true;
 }
 
-async function loadWholeList(mode, onProgress) {
-  // The tab counter is the target: once that many rows are loaded, stop.
-  const target = readPendingCount(mode);
-  let seen = actionRowButtons(mode).length;
-  let idle = 0;                                // passes in a row that added nothing
-  let rows = actionRowButtons(mode);
-
-  // One screen at a time, not a single jump to the bottom — Flipkart loads the
-  // next batch only as the end of the current one comes into view, and the fetch
-  // takes longer than one short wait (an earlier version gave up after 20 of 51).
-  for (let i = 0; i < 60 && idle < 3; i++) {
-    for (const el of scrollables()) {
-      el.scrollTop = Math.min(el.scrollHeight, el.scrollTop + Math.max(300, el.clientHeight * 0.85));
-    }
-    window.scrollBy(0, 400);
-    await sleep(rand(900, 1500));
-    rows = actionRowButtons(mode);
-    if (onProgress) onProgress(rows.length);
-    if (target && rows.length >= target) break;
-    if (rows.length > seen) { seen = rows.length; idle = 0; } else idle++;
+// ── SKU scan ────────────────────────────────────────────────────────────────
+// Walks every page and tallies the SKUs, then comes back to page 1. Only the SKU
+// text is kept, never element references — those die the moment a page changes.
+async function scanAllPages(mode, onProgress) {
+  const skus  = [];
+  const total = Math.max(1, pageButtons().length);
+  for (let i = 0; i < total; i++) {
+    if (i > 0 && !(await gotoPage(mode, i))) break;
+    await waitFor(() => actionRowButtons(mode).length > 0, 15000);
+    const rows = actionRowButtons(mode);
+    for (const r of rows) skus.push(r.sku);
+    if (onProgress) onProgress(skus.length, i + 1, total);
   }
-
-  // Snapshot taken above, BEFORE going back to the top, so nothing is lost if the
-  // page drops off-screen rows. Then return to the top so a run starts at row one.
-  for (const el of scrollables()) el.scrollTop = 0;
-  window.scrollTo({ top: 0 });
-  await sleep(600);
-  const afterScrollUp = actionRowButtons(mode);
-  return afterScrollUp.length >= rows.length ? afterScrollUp : rows;
+  if (total > 1) await gotoPage(mode, 0);      // leave the list back on page 1
+  return skus;
 }
 
 async function scanSkus(mode) {
-  await log('scanning the list — scrolling to load every order…');
-  const rows = await loadWholeList(mode, n => paint(mode, '(scanned ' + n + ')'));
+  const pages = Math.max(1, pageButtons().length);
+  await log('scanning ' + pages + ' page(s) of orders…');
+  const skus = await scanAllPages(mode, (n, p, t) =>
+    paint(mode, '(page ' + p + '/' + t + ', ' + n + ' orders)'));
+  const rows = skus.map(s => ({ sku: s }));
   const counts = new Map();
   for (const r of rows) counts.set(r.sku, (counts.get(r.sku) || 0) + 1);
   const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
@@ -611,6 +604,7 @@ async function runLoop(mode) {
     let sinceBreak  = 0;
     let breakAfter  = rand(PACE.breakEveryMin, PACE.breakEveryMax);
     let consecFails = 0;
+    let pageHop     = 0;   // how far through the pages we have looked for a ticked SKU
     const filter    = mode.skuFilter ? await getFilter(mode) : [];
     const wanted    = new Set(filter);
 
@@ -647,19 +641,21 @@ async function runLoop(mode) {
       // The page is healthy again — clear the reload counter.
       if (s.reloads) { s.reloads = 0; await setState(s); }
 
-      // Only the ticked SKUs, when a filter is set. Rows load lazily, so if none
-      // of what is on screen matches, scroll further down before giving up.
-      let candidates = wanted.size ? rows.filter(r => wanted.has(r.sku)) : rows;
+      // Only the ticked SKUs, when a filter is set. The chosen SKUs may sit on a
+      // later page, so walk the pages before concluding there is nothing left.
+      const candidates = wanted.size ? rows.filter(r => wanted.has(r.sku)) : rows;
       if (!candidates.length) {
-        await log('none of the loaded rows match the chosen SKUs — loading more…');
-        const more = await loadWholeList(mode);
-        candidates = more.filter(r => wanted.has(r.sku));
-        if (!candidates.length) {
-          s.running = false; await setState(s);
-          await log('DONE — no more orders for the chosen SKUs.');
-          break;
+        const pages = pageButtons().length;
+        pageHop += 1;
+        if (pageHop < pages && await gotoPage(mode, pageHop)) {
+          await log('no chosen SKUs on this page — page ' + (pageHop + 1) + ' of ' + pages);
+          continue;
         }
+        s.running = false; await setState(s);
+        await log('DONE — no more orders for the chosen SKUs.');
+        break;
       }
+      pageHop = 0;   // found work here — start from this page again next time
 
       // Work mostly top-down, but not always the very first row.
       const pick  = candidates[Math.random() < 0.75 ? 0 : rand(0, Math.min(3, candidates.length))];
