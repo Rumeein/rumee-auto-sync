@@ -1,29 +1,66 @@
-// ─── Rumee Extension — Flipkart "Mark RTD" one-by-one clicker ────────────────
+// ─── Rumee Extension — Flipkart one-by-one order actions ────────────────────
 // Runs on https://seller.flipkart.com/* (document_idle), but stays completely
-// inert unless the page is the Active Orders → Pending-to-Pack screen.
+// inert unless the page is Active Orders → Pending-to-Pack or Pending-to-Accept.
 //
-// WHY THIS EXISTS: Flipkart's bulk "Mark RTD" action is broken, so every order
-// has to be marked ready-to-dispatch with an individual click. This drives those
-// clicks one at a time, with randomised pacing so it behaves like a person
-// working through the list rather than a burst of scripted clicks.
+// WHY THIS EXISTS: Flipkart's bulk actions are broken, so every order has to be
+// handled with an individual click. This drives those clicks one at a time, with
+// randomised pacing so it behaves like a person working through the list rather
+// than a burst of scripted clicks.
 //
-// It is NOT part of the daily sync. It never auto-starts: it only runs after the
-// Start button on its own on-page panel is pressed. State lives in
-// chrome.storage.local so a page reload (its own, or Flipkart's) resumes the run
-// instead of losing it.
+// Two modes, picked automatically from the page URL:
+//   pendingToPack   → clicks "Mark RTD" on each row
+//   pendingToAccept → clicks "Accept" on each row, optionally only for the SKUs
+//                     ticked in the panel (Scan SKUs lists every SKU on the tab
+//                     with its order count first)
 //
-// Target page:
-//   https://seller.flipkart.com/index.html#dashboard/active-orders?query=%7B%22activeShipmentTile%22%3A%22pendingToPack%22%7D
+// It is NOT part of the daily sync and never auto-starts — only the Start button
+// on its own on-page panel begins a run. State lives in chrome.storage.local so a
+// page reload (its own, or Flipkart's) resumes the run instead of losing it.
 
 if (!window.__rumeeRtdInjected) {
 window.__rumeeRtdInjected = true;
 
 'use strict';
 
-const RTD_URL = 'https://seller.flipkart.com/index.html#dashboard/active-orders?query=%7B%22activeShipmentTile%22%3A%22pendingToPack%22%7D';
-const STATE_KEY = 'fkRtdBot';
-const LOG_KEY   = 'fkRtdLog';
-const UI_KEY    = 'fkRtdUi';   // panel position + collapsed state, so it stays put after a reload
+const STATE_KEY  = 'fkRtdBot';
+const LOG_KEY    = 'fkRtdLog';
+const UI_KEY     = 'fkRtdUi';      // panel position + collapsed state
+const FILTER_KEY = 'fkRtdFilter';  // { mode: [sku, sku, ...] } — survives reloads mid-run
+
+// The two Active Orders tabs this works on. `labels` are the exact button texts
+// on a row; `tile` is the counter chip used to confirm an action landed.
+const MODES = {
+  pack: {
+    id:     'pack',
+    tabKey: 'pendingToPack',
+    title:  'Mark RTD',
+    verb:   'Mark RTD',
+    labels: ['mark rtd', 'mark as rtd', 'mark ready to dispatch'],
+    tiles:  ['Pending RTD', 'To Pack'],
+    skuFilter: false,
+  },
+  accept: {
+    id:     'accept',
+    tabKey: 'pendingToAccept',
+    title:  'Accept orders',
+    verb:   'Accept',
+    labels: ['accept', 'accept order', 'accept orders'],
+    tiles:  ['To Accept'],
+    skuFilter: true,
+  },
+};
+
+const urlFor = mode =>
+  'https://seller.flipkart.com/index.html#dashboard/active-orders?query='
+  + encodeURIComponent('{"activeShipmentTile":"' + mode.tabKey + '"}');
+
+function currentMode() {
+  const h = decodeURIComponent(location.hash || '');
+  if (!/active-orders/i.test(h)) return null;
+  if (new RegExp(MODES.accept.tabKey, 'i').test(h)) return MODES.accept;
+  if (new RegExp(MODES.pack.tabKey,   'i').test(h)) return MODES.pack;
+  return null;
+}
 
 // Pacing (milliseconds). Every wait is randomised around these — never a fixed beat.
 const PACE = {
@@ -72,9 +109,9 @@ function isDisabled(el) {
   return false;
 }
 
-// A row's Mark RTD button sits inside a container that also carries the order's
-// SKU / FSN text. The toolbar's bulk Mark RTD button does not — that is how the
-// two are told apart, on top of the disabled check.
+// A row's action button sits inside a container that also carries the order's
+// SKU / FSN text. The toolbar's bulk button does not — that is how the two are
+// told apart, on top of the disabled check.
 function rowContextFor(el) {
   let node = el;
   for (let i = 0; i < 8 && node; i++) {
@@ -82,10 +119,10 @@ function rowContextFor(el) {
     if (!node) break;
     const t = txt(node);
     if (/SKU ID|FSN|Order ID/i.test(t) && t.length > 40) {
-      // The toolbar's bulk Mark RTD button has no row of its own, so walking up
-      // from it eventually lands on a container holding the WHOLE table. Anything
-      // covering more than one order is not a row — reject it outright (an outer
-      // container can only get bigger, so there is no point walking further).
+      // The toolbar's bulk button has no row of its own, so walking up from it
+      // eventually lands on a container holding the WHOLE table. Anything covering
+      // more than one order is not a row — reject it outright (an outer container
+      // can only get bigger, so there is no point walking further).
       if ((t.match(/SKU ID/gi) || []).length > 1 || t.length > 600) return null;
       return { node, text: t };
     }
@@ -93,28 +130,42 @@ function rowContextFor(el) {
   return null;
 }
 
-function rtdRowButtons() {
+function skuOf(rowText) {
+  const m = rowText.match(/SKU ID:\s*([^|]+?)\s*(?:\||FSN\b|$)/i);
+  return m ? m[1].trim() : '(no SKU)';
+}
+
+function actionRowButtons(mode) {
   const nodes = [...document.querySelectorAll('button, a, [role="button"]')];
   const out = [];
   for (const el of nodes) {
     const t = txt(el).toLowerCase();
-    if (t !== 'mark rtd' && t !== 'mark as rtd' && t !== 'mark ready to dispatch') continue;
+    if (mode.labels.indexOf(t) === -1) continue;
     if (!isVisible(el) || isDisabled(el)) continue;
     const ctx = rowContextFor(el);
     if (!ctx) continue;                       // toolbar / bulk button — skip
-    out.push({ el, ctx });
+    out.push({ el, ctx, sku: skuOf(ctx.text) });
   }
   return out;
 }
 
-// "Pending RTD  59" chip, falling back to null when it is not on screen.
-function readPendingCount() {
+// Reads a counter chip such as "Pending RTD 75" or the "0 To Accept" tile.
+function readTile(label) {
   const nodes = [...document.querySelectorAll('div, span, li, button, a')];
+  const re    = new RegExp('^(\\d+)\\s*' + label + '$|^' + label + '\\s*(\\d+)$', 'i');
   for (const el of nodes) {
     const t = txt(el);
     if (t.length > 30) continue;
-    const m = t.match(/^Pending\s*RTD\s*(\d+)$/i);
-    if (m) return parseInt(m[1], 10);
+    const m = t.match(re);
+    if (m) return parseInt(m[1] || m[2], 10);
+  }
+  return null;
+}
+
+function readPendingCount(mode) {
+  for (const label of mode.tiles) {
+    const n = readTile(label);
+    if (n != null) return n;
   }
   return null;
 }
@@ -127,15 +178,22 @@ function isLoggedOut() {
       || title.includes('sign in');
 }
 
-const onTargetPage = () => /active-orders/i.test(location.hash)
-                        && /pendingToPack/i.test(decodeURIComponent(location.hash));
-
 // ── state ───────────────────────────────────────────────────────────────────
 const getState = async () => (await chrome.storage.local.get(STATE_KEY))[STATE_KEY] || null;
 const setState = async s   => chrome.storage.local.set({ [STATE_KEY]: s });
 
+async function getFilter(mode) {
+  const all = (await chrome.storage.local.get(FILTER_KEY))[FILTER_KEY] || {};
+  return all[mode.id] || [];
+}
+async function setFilter(mode, skus) {
+  const all = (await chrome.storage.local.get(FILTER_KEY))[FILTER_KEY] || {};
+  all[mode.id] = skus;
+  await chrome.storage.local.set({ [FILTER_KEY]: all });
+}
+
 // ── on-page panel ───────────────────────────────────────────────────────────
-let panel, logBox, statLine;
+let panel, logBox, statLine, skuBox;
 
 async function log(line) {
   const stamp = new Date().toLocaleTimeString('en-IN', { hour12: false });
@@ -157,15 +215,15 @@ async function log(line) {
   if (logBox) { logBox.textContent = store.slice(-80).join('\n'); logBox.scrollTop = logBox.scrollHeight; }
 }
 
-function buildPanel() {
+function buildPanel(mode) {
   if (panel) return;
   panel = document.createElement('div');
   panel.id = '__rumeeRtdPanel';
   panel.innerHTML = [
     '<style>',
-    // Default bottom-LEFT: the Mark RTD buttons live on the right of the table,
+    // Default bottom-LEFT: the action buttons live on the right of the table,
     // and the panel must never sit on top of the thing it is clicking.
-    '#__rumeeRtdPanel{position:fixed;left:16px;bottom:16px;width:330px;z-index:2147483647;',
+    '#__rumeeRtdPanel{position:fixed;left:16px;bottom:16px;width:340px;z-index:2147483647;',
     'background:#14161a;color:#e8eaed;font:12px/1.45 system-ui,Segoe UI,Arial;border-radius:10px;',
     'box-shadow:0 8px 28px rgba(0,0,0,.45);overflow:hidden}',
     '#__rumeeRtdPanel h4{margin:0;padding:9px 12px;background:#1f6feb;font-size:13px;font-weight:600;',
@@ -175,26 +233,36 @@ function buildPanel() {
     '#__rumeeRtdPanel .bd{padding:10px 12px}',
     '#__rumeeRtdPanel .row{display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap}',
     '#__rumeeRtdPanel button{flex:1;padding:7px 8px;border:0;border-radius:6px;cursor:pointer;',
-    'font-size:12px;font-weight:600;color:#fff}',
+    'font-size:12px;font-weight:600;color:#fff;background:#3d444d}',
     '#__rumeeRtdPanel .go{background:#1a7f37}',
     '#__rumeeRtdPanel .stop{background:#b62324}',
-    '#__rumeeRtdPanel .probe{background:#3d444d}',
+    '#__rumeeRtdPanel .scan{background:#8250df}',
     '#__rumeeRtdPanel input[type=number]{width:62px;background:#0d1117;color:#e8eaed;border:1px solid #30363d;',
     'border-radius:5px;padding:4px 6px}',
     '#__rumeeRtdPanel .stat{font-size:12px;margin-bottom:8px;color:#9fb0c0}',
-    '#__rumeeRtdPanel pre{margin:0;height:150px;overflow:auto;background:#0d1117;border-radius:6px;',
+    '#__rumeeRtdPanel pre{margin:0;height:140px;overflow:auto;background:#0d1117;border-radius:6px;',
     'padding:7px;font:11px/1.4 Consolas,monospace;white-space:pre-wrap;color:#adbac7}',
     '#__rumeeRtdPanel label{color:#9fb0c0}',
+    '#__rumeeRtdPanel .skus{max-height:150px;overflow:auto;background:#0d1117;border-radius:6px;',
+    'padding:6px 8px;margin-bottom:8px;display:none}',
+    '#__rumeeRtdPanel .skus div{display:flex;gap:6px;align-items:center;padding:2px 0;color:#c9d1d9}',
+    '#__rumeeRtdPanel .skus b{margin-left:auto;color:#7ee787;font-weight:600}',
+    '#__rumeeRtdPanel .hint{color:#6e7681;font-size:11px;margin-bottom:8px}',
     '</style>',
-    '<h4><span>Rumee — Mark RTD helper</span><button id="__rtdToggle" title="Collapse">–</button></h4>',
+    '<h4><span>Rumee — ' + mode.title + '</span><button id="__rtdToggle" title="Collapse">–</button></h4>',
     '<div class="bd">',
     '  <div class="stat" id="__rtdStat">Idle</div>',
+    (mode.skuFilter
+      ? '  <div class="row"><button class="scan" id="__rtdScan">Scan SKUs</button></div>'
+        + '  <div class="skus" id="__rtdSkus"></div>'
+        + '  <div class="hint" id="__rtdHint">Scan first, then tick the SKUs to accept. Nothing ticked = all of them.</div>'
+      : ''),
     '  <div class="row"><label><input type="checkbox" id="__rtdDry" checked> Dry run (no clicks)</label></div>',
     '  <div class="row"><label>Stop after <input type="number" id="__rtdLimit" min="1" value="50"> orders</label></div>',
     '  <div class="row">',
     '    <button class="go" id="__rtdStart">Start</button>',
     '    <button class="stop" id="__rtdStop">Stop</button>',
-    '    <button class="probe" id="__rtdProbe">Probe</button>',
+    '    <button id="__rtdProbe">Probe</button>',
     '  </div>',
     '  <pre id="__rtdLog"></pre>',
     '</div>',
@@ -202,6 +270,7 @@ function buildPanel() {
   document.body.appendChild(panel);
   logBox   = panel.querySelector('#__rtdLog');
   statLine = panel.querySelector('#__rtdStat');
+  skuBox   = panel.querySelector('#__rtdSkus');
 
   // ── collapse / expand ──
   const body   = panel.querySelector('.bd');
@@ -230,11 +299,9 @@ function buildPanel() {
   });
   document.addEventListener('mousemove', e => {
     if (!drag) return;
-    const left = Math.max(0, Math.min(window.innerWidth  - 80, e.clientX - drag.dx));
-    const top  = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - drag.dy));
-    panel.style.left = left + 'px';
-    panel.style.top  = top + 'px';
-    panel.style.right = 'auto';
+    panel.style.left   = Math.max(0, Math.min(window.innerWidth  - 80, e.clientX - drag.dx)) + 'px';
+    panel.style.top    = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - drag.dy)) + 'px';
+    panel.style.right  = 'auto';
     panel.style.bottom = 'auto';
   });
   document.addEventListener('mouseup', async () => {
@@ -258,13 +325,24 @@ function buildPanel() {
     applyCollapsed(!!ui.collapsed);
   });
 
+  // ── buttons ──
+  if (mode.skuFilter) {
+    panel.querySelector('#__rtdScan').onclick = () => scanSkus(mode);
+  }
+
   panel.querySelector('#__rtdStart').onclick = async () => {
     const dryRun = panel.querySelector('#__rtdDry').checked;
     const limit  = parseInt(panel.querySelector('#__rtdLimit').value, 10) || 1;
+    if (mode.skuFilter) await setFilter(mode, tickedSkus());
+    const picked = mode.skuFilter ? await getFilter(mode) : [];
     await chrome.storage.local.set({ [LOG_KEY]: [] });
-    await setState({ running: true, dryRun, limit, done: 0, failed: 0, reloads: 0, startedAt: Date.now() });
-    await log('START — ' + (dryRun ? 'DRY RUN' : 'LIVE') + ', limit ' + limit);
-    runLoop();
+    await setState({
+      mode: mode.id, running: true, dryRun, limit,
+      done: 0, failed: 0, reloads: 0, startedAt: Date.now(),
+    });
+    await log('START — ' + mode.verb + ', ' + (dryRun ? 'DRY RUN' : 'LIVE') + ', limit ' + limit
+      + (mode.skuFilter ? (picked.length ? ', SKUs: ' + picked.join(', ') : ', all SKUs') : ''));
+    runLoop(mode);
   };
 
   panel.querySelector('#__rtdStop').onclick = async () => {
@@ -275,25 +353,89 @@ function buildPanel() {
   };
 
   panel.querySelector('#__rtdProbe').onclick = async () => {
-    const btns = rtdRowButtons();
-    await log('PROBE: pending chip = ' + readPendingCount() + ', row buttons found = ' + btns.length);
+    const btns = actionRowButtons(mode);
+    await log('PROBE (' + mode.verb + '): counter = ' + readPendingCount(mode)
+      + ', row buttons found = ' + btns.length);
     for (let i = 0; i < Math.min(3, btns.length); i++) {
-      await log('  [' + i + '] "' + txt(btns[i].el) + '" | row: ' + btns[i].ctx.text.slice(0, 90));
+      await log('  [' + i + '] SKU "' + btns[i].sku + '" | ' + btns[i].ctx.text.slice(0, 70));
     }
     const all = [...document.querySelectorAll('button, a, [role="button"]')]
-      .filter(e => /mark\s*rtd/i.test(txt(e)));
-    await log('  all "Mark RTD"-ish elements on page = ' + all.length + ' (usable rows = ' + btns.length + ')');
+      .filter(e => mode.labels.indexOf(txt(e).toLowerCase()) !== -1);
+    await log('  matching elements on page = ' + all.length + ' (usable rows = ' + btns.length + ')');
   };
 }
 
-async function paint(extra) {
+function tickedSkus() {
+  if (!skuBox) return [];
+  return [...skuBox.querySelectorAll('input[type=checkbox]')]
+    .filter(c => c.checked).map(c => c.dataset.sku);
+}
+
+async function paint(mode, extra) {
   const s = await getState();
   if (!statLine) return;
-  const pending = readPendingCount();
-  const tail = (pending != null ? ', pending ' + pending : '') + (extra ? ' ' + extra : '');
+  const pending = readPendingCount(mode);
+  const tail = (pending != null ? ', on this tab ' + pending : '') + (extra ? ' ' + extra : '');
   statLine.textContent = (s && s.running)
     ? 'Running — done ' + s.done + ', failed ' + s.failed + tail
     : 'Idle' + tail;
+}
+
+// ── SKU scan ────────────────────────────────────────────────────────────────
+// Flipkart renders the order list lazily, so a plain count only sees what is
+// near the viewport. Scroll every scrollable container to the bottom, repeatedly,
+// until no new rows appear — then the SKU counts are the real totals.
+function scrollables() {
+  return [...document.querySelectorAll('div, main, section')].filter(el => {
+    if (el.scrollHeight <= el.clientHeight + 60) return false;
+    const o = getComputedStyle(el).overflowY;
+    return o === 'auto' || o === 'scroll';
+  });
+}
+
+async function loadWholeList(mode, onProgress) {
+  let seen = actionRowButtons(mode).length;
+  for (let i = 0; i < 30; i++) {
+    window.scrollTo({ top: document.body.scrollHeight });
+    for (const el of scrollables()) el.scrollTop = el.scrollHeight;
+    await sleep(rand(700, 1300));
+    const now = actionRowButtons(mode).length;
+    if (onProgress) onProgress(now);
+    if (now <= seen) break;                    // nothing new loaded — that is the end
+    seen = now;
+  }
+  window.scrollTo({ top: 0 });
+  for (const el of scrollables()) el.scrollTop = 0;
+  await sleep(600);
+  return actionRowButtons(mode);
+}
+
+async function scanSkus(mode) {
+  await log('scanning the list — scrolling to load every order…');
+  const rows = await loadWholeList(mode, n => paint(mode, '(scanned ' + n + ')'));
+  const counts = new Map();
+  for (const r of rows) counts.set(r.sku, (counts.get(r.sku) || 0) + 1);
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const previously = await getFilter(mode);
+
+  skuBox.innerHTML = '';
+  for (const [sku, n] of sorted) {
+    const line = document.createElement('div');
+    const cb   = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.dataset.sku = sku;
+    cb.checked = previously.indexOf(sku) !== -1;
+    const name = document.createElement('span');
+    name.textContent = sku;
+    const cnt = document.createElement('b');
+    cnt.textContent = n + (n === 1 ? ' order' : ' orders');
+    line.appendChild(cb); line.appendChild(name); line.appendChild(cnt);
+    skuBox.appendChild(line);
+  }
+  skuBox.style.display = sorted.length ? 'block' : 'none';
+  await log('scan done — ' + rows.length + ' order(s) across ' + sorted.length + ' SKU(s):');
+  for (const [sku, n] of sorted) await log('   ' + n + ' × ' + sku);
+  await paint(mode);
 }
 
 // ── human-like click ────────────────────────────────────────────────────────
@@ -342,15 +484,18 @@ async function idleFidget() {
   }
 }
 
-// ── confirmation modal (Flipkart may or may not show one) ───────────────────
+// ── confirmation dialog (Flipkart may or may not show one) ──────────────────
 async function confirmModalIfAny() {
   await sleep(rand(500, 1200));
-  const wanted = ['yes', 'confirm', 'proceed', 'ok', 'mark rtd', 'yes, mark rtd', 'continue'];
+  const wanted = ['yes', 'confirm', 'proceed', 'ok', 'continue',
+                  'mark rtd', 'yes, mark rtd', 'accept', 'accept order', 'yes, accept'];
   const candidates = [...document.querySelectorAll('button, [role="button"]')].filter(el =>
     isVisible(el) && !isDisabled(el) && wanted.indexOf(txt(el).toLowerCase()) !== -1);
-  // Only treat it as a modal if the button sits inside an overlay-ish container.
+  // Only a button inside an overlay counts, and never one that belongs to a row —
+  // otherwise "Accept" in the next row would be mistaken for a dialog button.
   const modalBtn = candidates.find(el =>
-    el.closest('[class*="modal" i],[class*="dialog" i],[class*="popup" i],[role="dialog"]'));
+    el.closest('[class*="modal" i],[class*="dialog" i],[class*="popup" i],[role="dialog"]')
+    && !rowContextFor(el));
   if (!modalBtn) return false;
   await log('  confirmation dialog → clicking "' + txt(modalBtn) + '"');
   await humanClick(modalBtn);
@@ -361,13 +506,13 @@ async function confirmModalIfAny() {
 // ── waiting / recovery ──────────────────────────────────────────────────────
 // Waits for the order list to render. Flipkart's dashboard is slow and sometimes
 // never finishes painting — in that case the page is reloaded and we wait again.
-async function waitForRows() {
+async function waitForRows(mode) {
   const deadline = Date.now() + PACE.rowWaitMs;
   while (Date.now() < deadline) {
     const s = await getState();
     if (!s || !s.running) return [];
     if (isLoggedOut()) return 'LOGGED_OUT';
-    const btns = rtdRowButtons();
+    const btns = actionRowButtons(mode);
     if (btns.length) return btns;
     // The list may be inside a collapsed "Dispatch by ..." group — open it once.
     const group = [...document.querySelectorAll('div,button,span,[role="button"]')]
@@ -378,7 +523,7 @@ async function waitForRows() {
   return [];
 }
 
-async function reloadAndResume(why) {
+async function reloadAndResume(mode, why) {
   const s = await getState();
   if (!s) return;
   s.reloads = (s.reloads || 0) + 1;
@@ -390,20 +535,22 @@ async function reloadAndResume(why) {
     return;
   }
   await sleep(rand(1200, 3000));
-  if (!onTargetPage()) location.href = RTD_URL;
+  if (!currentMode()) location.href = urlFor(mode);
   location.reload();
 }
 
 // ── main loop ───────────────────────────────────────────────────────────────
 let looping = false;
 
-async function runLoop() {
+async function runLoop(mode) {
   if (looping) return;
   looping = true;
   try {
     let sinceBreak  = 0;
     let breakAfter  = rand(PACE.breakEveryMin, PACE.breakEveryMax);
     let consecFails = 0;
+    const filter    = mode.skuFilter ? await getFilter(mode) : [];
+    const wanted    = new Set(filter);
 
     for (;;) {
       const s = await getState();
@@ -419,48 +566,61 @@ async function runLoop() {
         await log('STOPPED — Flipkart session expired. Log in again, then press Start.');
         break;
       }
-      if (!onTargetPage()) { await reloadAndResume('not on the pending-to-pack page'); return; }
+      if (!currentMode()) { await reloadAndResume(mode, 'not on the ' + mode.title + ' tab'); return; }
 
-      const rows = await waitForRows();
+      const rows = await waitForRows(mode);
       if (rows === 'LOGGED_OUT') continue;
       if (!rows.length) {
-        const pending = readPendingCount();
-        if (pending === 0) {
+        if (readPendingCount(mode) === 0) {
           s.running = false; await setState(s);
-          await log('DONE — nothing left pending.');
+          await log('DONE — nothing left on this tab.');
           break;
         }
-        await reloadAndResume('no Mark RTD buttons rendered'); return;
+        await reloadAndResume(mode, 'no ' + mode.verb + ' buttons rendered'); return;
       }
 
       // The page is healthy again — clear the reload counter.
       if (s.reloads) { s.reloads = 0; await setState(s); }
 
+      // Only the ticked SKUs, when a filter is set. Rows load lazily, so if none
+      // of what is on screen matches, scroll further down before giving up.
+      let candidates = wanted.size ? rows.filter(r => wanted.has(r.sku)) : rows;
+      if (!candidates.length) {
+        await log('none of the loaded rows match the chosen SKUs — loading more…');
+        const more = await loadWholeList(mode);
+        candidates = more.filter(r => wanted.has(r.sku));
+        if (!candidates.length) {
+          s.running = false; await setState(s);
+          await log('DONE — no more orders for the chosen SKUs.');
+          break;
+        }
+      }
+
       // Work mostly top-down, but not always the very first row.
-      const pick  = rows[Math.random() < 0.75 ? 0 : rand(0, Math.min(3, rows.length))];
-      const label = pick.ctx.text.slice(0, 80);
-      await paint();
+      const pick  = candidates[Math.random() < 0.75 ? 0 : rand(0, Math.min(3, candidates.length))];
+      const label = pick.sku + ' — ' + pick.ctx.text.slice(0, 60);
+      await paint(mode);
       await idleFidget();
 
       if (s.dryRun) {
-        await log('(dry) would click Mark RTD → ' + label);
+        await log('(dry) would click ' + mode.verb + ' → ' + label);
         s.done += 1; await setState(s);
         await humanPause(700, 1400);
         continue;
       }
 
       await log('click ' + (s.done + 1) + '/' + s.limit + ' → ' + label);
-      const before = readPendingCount();
+      const before = readPendingCount(mode);
       await humanClick(pick.el);
       await confirmModalIfAny();
 
-      // Success = that row's button left the screen, or the pending count dropped.
+      // Success = that row's button left the screen, or the tab counter dropped.
       const deadline = Date.now() + PACE.confirmWaitMs;
       let ok = false;
       while (Date.now() < deadline) {
         await sleep(500);
         if (!document.contains(pick.el) || !isVisible(pick.el)) { ok = true; break; }
-        const after = readPendingCount();
+        const after = readPendingCount(mode);
         if (before != null && after != null && after < before) { ok = true; break; }
       }
 
@@ -470,7 +630,7 @@ async function runLoop() {
       if (ok) {
         st.done += 1; consecFails = 0;
         await setState(st);
-        await log('  marked OK (' + st.done + ' done)');
+        await log('  ' + mode.verb + ' OK (' + st.done + ' done)');
       } else {
         st.failed += 1; consecFails += 1;
         await setState(st);
@@ -480,14 +640,14 @@ async function runLoop() {
           await log('STOPPED — clicks are not doing anything. Press Probe and send me the log.');
           break;
         }
-        await reloadAndResume('click had no effect'); return;
+        await reloadAndResume(mode, 'click had no effect'); return;
       }
 
       sinceBreak += 1;
-      await paint();
+      await paint(mode);
 
       if (st.done % PACE.reloadEveryClicks === 0) {
-        await reloadAndResume('periodic refresh of the list'); return;
+        await reloadAndResume(mode, 'periodic refresh of the list'); return;
       }
 
       if (sinceBreak >= breakAfter) {
@@ -505,25 +665,28 @@ async function runLoop() {
     if (s) { s.running = false; await setState(s); }
   } finally {
     looping = false;
-    await paint();
+    await paint(mode);
   }
 }
 
 // ── boot ────────────────────────────────────────────────────────────────────
 (async () => {
-  // Only ever mount on the Active Orders screen — every other Flipkart page,
+  // Only ever mount on the two Active Orders tabs — every other Flipkart page,
   // including the tabs the daily sync drives, is left untouched.
   const mount = async () => {
-    if (!onTargetPage()) return;
-    buildPanel();
+    const mode = currentMode();
+    if (!mode) return;
+    if (panel && panel.__rumeeMode !== mode.id) { panel.remove(); panel = null; }  // switched tab
+    buildPanel(mode);
+    panel.__rumeeMode = mode.id;
     const store = (await chrome.storage.local.get(LOG_KEY))[LOG_KEY] || [];
     if (logBox) logBox.textContent = store.slice(-80).join('\n');
-    await paint();
+    await paint(mode);
     const s = await getState();
-    if (s && s.running) {
+    if (s && s.running && s.mode === mode.id) {
       await log('resuming after page load…');
       await sleep(rand(2000, 4500));   // let the list paint before touching it
-      runLoop();
+      runLoop(mode);
     }
   };
   await mount();
