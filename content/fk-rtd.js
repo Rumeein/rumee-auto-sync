@@ -26,7 +26,7 @@ window.__rumeeRtdInjected = true;
 
 'use strict';
 
-const BUILD      = '2026-08-19e';  // shown in the log so it is obvious which build a tab is running
+const BUILD      = '2026-08-19f';  // shown in the log so it is obvious which build a tab is running
 const STATE_KEY  = 'fkRtdBot';
 const LOG_KEY    = 'fkRtdLog';
 const UI_KEY     = 'fkRtdUi';      // panel position + collapsed state
@@ -60,9 +60,33 @@ const MODES = {
     // Printing may open a viewer or start a download, either of which takes a
     // moment longer than a plain button press.
     confirmWaitMs: 20000,
-    // Whether the row vanishes on its own is unknown, and a re-render would look
-    // exactly like success — so only a drop in the Pending Label count counts.
-    verifyByCounter: true,
+    // Getting the file on disk is the point of this mode, so that is what counts
+    // as success — not whether Flipkart also moved the row off the sub-tab.
+    successOnAct: true,
+    async act(pick) {
+      // Arm the background listener first: it cancels Chrome's own download (which
+      // is what puts the Save-As box on screen) and re-downloads the same URL into
+      // the Downloads folder with no prompt.
+      await chrome.runtime.sendMessage({ type: 'LABEL_ARM' });
+      await humanClick(pick.el);
+
+      const res = await waitFor(async () => {
+        const r = (await chrome.storage.local.get('_labelDownloadResult'))._labelDownloadResult;
+        return r || null;
+      }, 30000);
+
+      if (!res) {
+        await chrome.runtime.sendMessage({ type: 'LABEL_DISARM' });
+        await log('  no label download appeared — if a Save-As box is on screen, close it and tell me');
+        return false;
+      }
+      if (!res.ok) {
+        await log('  label NOT saved — ' + res.reason);
+        return false;
+      }
+      await log('  saved → ' + res.filename);
+      return true;
+    },
   },
   accept: {
     id:     'accept',
@@ -167,7 +191,7 @@ async function humanPause(min, max) {
 async function waitFor(fn, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const v = fn();
+    const v = await fn();   // works for plain predicates too
     if (v) return v;
     if (Date.now() > deadline) return null;
     await sleep(250);
@@ -758,8 +782,10 @@ async function runLoop(mode) {
 
       await log('click ' + (s.done + 1) + '/' + s.limit + ' → ' + label);
       const before = readPendingCount(mode);
+      let preVerified = false;
       if (mode.act) {
         const acted = await mode.act(pick);
+        if (acted && mode.successOnAct) preVerified = true;
         if (!acted) {
           // Count it as a failure rather than retrying forever — an earlier
           // version looped on the same row indefinitely.
@@ -781,8 +807,8 @@ async function runLoop(mode) {
 
       // Success = that row's button left the screen, or the tab counter dropped.
       const deadline = Date.now() + (mode.confirmWaitMs || PACE.confirmWaitMs);
-      let ok = false;
-      while (Date.now() < deadline) {
+      let ok = preVerified;
+      while (!ok && Date.now() < deadline) {
         await sleep(500);
         // On a tab where opening a row re-renders it, the clicked element detaches
         // whether or not anything was accepted — so there the counter is the only

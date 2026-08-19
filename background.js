@@ -655,6 +655,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Label printer (content/fk-rtd.js) arms this before clicking a row's "Print
+  // Labels". Same trick as RELAY_ARM — cancel Chrome's own download so no Save-As
+  // box appears — except the file is wanted on disk, so it is re-downloaded
+  // through the extension with saveAs:false straight into the Downloads folder.
+  // Nothing here runs unless the panel armed it moments earlier.
+  if (msg.type === 'LABEL_ARM') {
+    _labelArmedAt = Date.now();
+    chrome.storage.local.remove('_labelDownloadResult', () => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.type === 'LABEL_DISARM') {
+    _labelArmedAt = 0;
+    sendResponse({ ok: true });
+    return true;
+  }
+
   // Backfill pages arm the download interceptor before clicking the download button.
   if (msg.type === 'BACKFILL_ARM') {
     _backfillDownload = { filename: msg.filename, folderKey: msg.folderKey, mimeType: msg.mimeType };
@@ -1586,6 +1602,40 @@ let _backfillDownload = null;
 // Relay-arm: armed by RELAY_ARM (jobs whose content script must fetch the
 // file itself for CORS reasons). Cleared after first use.
 let _relayArmedJobId = null;
+// Set by LABEL_ARM just before the label panel clicks a "Print Labels" button.
+// Times out on its own so a stray download minutes later is never touched.
+let _labelArmedAt = 0;
+const LABEL_ARM_WINDOW_MS = 60000;
+
+// Writes the outcome where the panel can read it, so a failure is visible in the
+// panel log instead of disappearing silently.
+function reportLabelResult(result) {
+  chrome.storage.local.set({ _labelDownloadResult: { ...result, ts: Date.now() } });
+}
+
+// Waits for the re-issued download to finish, then reports where it landed.
+function trackLabelDownload(id) {
+  const deadline = Date.now() + 30000;
+  const poll = () => {
+    chrome.downloads.search({ id }, (items) => {
+      const it = items && items[0];
+      if (it && it.state === 'complete') {
+        reportLabelResult({ ok: true, filename: it.filename || '(saved)' });
+        return;
+      }
+      if (it && it.state === 'interrupted') {
+        reportLabelResult({ ok: false, reason: 'Chrome stopped the download: ' + (it.error || 'unknown') });
+        return;
+      }
+      if (Date.now() > deadline) {
+        reportLabelResult({ ok: false, reason: 'download did not finish within 30s' });
+        return;
+      }
+      setTimeout(poll, 700);
+    });
+  };
+  poll();
+}
 
 // ─── Chrome download interceptor ─────────────────────────────────────────────
 //
@@ -1604,6 +1654,28 @@ let _relayArmedJobId = null;
 // job is actively running). User-initiated downloads outside a sync are untouched.
 
 chrome.downloads.onCreated.addListener((item) => {
+  // ── LABEL PATH — shipping labels, saved to the Downloads folder ───────────
+  // Only ever active in the seconds after the label panel armed it.
+  if (_labelArmedAt && Date.now() - _labelArmedAt < LABEL_ARM_WINDOW_MS) {
+    _labelArmedAt = 0;
+    const url = item.url || '';
+    chrome.downloads.cancel(item.id, () => { chrome.downloads.erase({ id: item.id }, () => {}); });
+    console.log(`[Rumee] downloads.onCreated (label): ${url.slice(0, 120)}`);
+    if (url.startsWith('blob:')) {
+      // A blob belongs to the page that made it; the extension cannot fetch it.
+      reportLabelResult({ ok: false, reason: 'label is built inside the page (blob), so it cannot be re-downloaded — turn off Chrome\'s "Ask where to save each file" instead' });
+      return;
+    }
+    chrome.downloads.download({ url, saveAs: false }, (id) => {
+      if (chrome.runtime.lastError || id == null) {
+        reportLabelResult({ ok: false, reason: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'download refused' });
+        return;
+      }
+      trackLabelDownload(id);
+    });
+    return;
+  }
+
   // ── RELAY PATH — content script needs the raw URL, not a background fetch ─
   if (_relayArmedJobId) {
     const jobId = _relayArmedJobId;
