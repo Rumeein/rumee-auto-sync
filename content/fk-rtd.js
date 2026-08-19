@@ -62,7 +62,15 @@ const MODES = {
         .filter(Boolean);
     },
     async act(pick) {
-      await humanClick(pick.el);                       // open the row's panel
+      // Single click only, and confirm it actually opened — the header is a
+      // toggle, so a second click would close it again.
+      await humanClick(pick.el, { single: true });
+      let open = await waitFor(() => pick.el.getAttribute('aria-expanded') === 'true', 3000);
+      if (!open) {
+        await humanClick(pick.el, { single: true });
+        open = await waitFor(() => pick.el.getAttribute('aria-expanded') === 'true', 3000);
+      }
+      if (!open) { await log('  row panel would not open'); return false; }
       const scope = pick.el.closest('[data-testid^="accordion-component"]')
                  || pick.el.parentElement;
       const btn = await waitFor(() => [...scope.querySelectorAll('button')].find(b =>
@@ -503,7 +511,10 @@ function fire(el, type, x, y) {
   }));
 }
 
-async function humanClick(el) {
+// opts.single — send exactly one click. The `el.click()` fallback below is a
+// second click as far as a toggle is concerned: on the Accept accordion it
+// opened the panel and immediately shut it again, so nothing could be accepted.
+async function humanClick(el, opts) {
   el.scrollIntoView({ block: 'center', behavior: 'smooth' });
   await sleep(rand(400, 1100));                       // settle + look at the row
   const r = el.getBoundingClientRect();
@@ -516,7 +527,7 @@ async function humanClick(el) {
   await sleep(rand(55, 165));                         // press duration
   fire(el, 'pointerup', x, y); fire(el, 'mouseup', x, y);
   fire(el, 'click', x, y);
-  if (typeof el.click === 'function') {
+  if (!(opts && opts.single) && typeof el.click === 'function') {
     // Belt-and-braces: some Flipkart controls bind only the framework's own
     // click handler, which the synthetic sequence above can miss.
     await sleep(rand(40, 90));
@@ -674,7 +685,20 @@ async function runLoop(mode) {
       const before = readPendingCount(mode);
       if (mode.act) {
         const acted = await mode.act(pick);
-        if (!acted) { await humanPause(1200, 2500); continue; }
+        if (!acted) {
+          // Count it as a failure rather than retrying forever — an earlier
+          // version looped on the same row indefinitely.
+          consecFails += 1;
+          const sf = await getState();
+          if (sf) { sf.failed += 1; await setState(sf); }
+          if (consecFails >= PACE.maxFails) {
+            if (sf) { sf.running = false; await setState(sf); }
+            await log('STOPPED — could not open ' + PACE.maxFails + ' rows in a row.');
+            break;
+          }
+          await humanPause(1200, 2500);
+          continue;
+        }
       } else {
         await humanClick(pick.el);
       }
