@@ -22,7 +22,7 @@ window.__rumeeRtdInjected = true;
 
 'use strict';
 
-const BUILD      = '2026-08-19c';  // shown in the log so it is obvious which build a tab is running
+const BUILD      = '2026-08-19d';  // shown in the log so it is obvious which build a tab is running
 const STATE_KEY  = 'fkRtdBot';
 const LOG_KEY    = 'fkRtdLog';
 const UI_KEY     = 'fkRtdUi';      // panel position + collapsed state
@@ -63,14 +63,24 @@ const MODES = {
         .filter(Boolean);
     },
     async act(pick) {
-      const scope = pick.el.closest('[data-testid^="accordion-component"]')
-                 || pick.el.parentElement;
-      const findAcceptAll = () => [...scope.querySelectorAll('button')].find(b =>
-        /^accept all \d+ orders?$/i.test(txt(b)) && isVisible(b) && !isDisabled(b));
+      // Opening a row re-renders it, which detaches the very element that was
+      // clicked — so anything scoped to it (its parent, its ancestors) is stale
+      // and finds nothing, even though the panel is plainly open on screen. Only
+      // one row panel is ever open, so search the whole page instead.
+      const findAcceptAll = () => {
+        const all = [...document.querySelectorAll('button')].filter(b =>
+          /^accept all \d+ orders?$/i.test(txt(b)) && isVisible(b) && !isDisabled(b));
+        if (all.length < 2) return all[0] || null;
+        const mine = all.find(b => {
+          const c = rowContextFor(b);
+          return c && skuOf(c.text) === pick.sku;
+        });
+        return mine || all[0];
+      };
 
-      // One native click opens the row. aria-expanded is not trustworthy here —
-      // it stayed "false" on a panel that had visibly opened — so the arrival of
-      // the "Accept All ..." button is the real signal.
+      // One native click opens the row; the arrival of the "Accept All ..."
+      // button is the signal (aria-expanded is not reliable here — it read
+      // "false" on a panel that had visibly opened).
       await humanClick(pick.el, { native: true });
       const btn = await waitFor(findAcceptAll, 8000);
       if (!btn) { await log('  row panel did not open'); return false; }
@@ -741,7 +751,10 @@ async function runLoop(mode) {
       let ok = false;
       while (Date.now() < deadline) {
         await sleep(500);
-        if (!document.contains(pick.el) || !isVisible(pick.el)) { ok = true; break; }
+        // On a tab where opening a row re-renders it, the clicked element detaches
+        // whether or not anything was accepted — so there the counter is the only
+        // honest signal. Elsewhere the row leaving the screen is the signal.
+        if (!mode.act && (!document.contains(pick.el) || !isVisible(pick.el))) { ok = true; break; }
         const after = readPendingCount(mode);
         if (before != null && after != null && after < before) { ok = true; break; }
       }
