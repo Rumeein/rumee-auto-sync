@@ -45,11 +45,33 @@ const MODES = {
     title:  'Accept orders',
     verb:   'Accept',
     labels: ['accept', 'accept order', 'accept orders'],
-    // Jaiswal recalls the button reading "Accept Order"/"Accept Orders"; allow a
-    // trailing count too, e.g. "Accept Orders (2)", which an exact match misses.
-    match:  t => /^accept(\s+orders?)?(\s*\(\d+\))?$/i.test(t),
     tiles:  ['To Accept'],
     skuFilter: true,
+    // Inspected live 2026-08-19: a row's "Accept Orders" is NOT a button — it is
+    // an accordion header (a plain div, data-testid="accordion-header") that
+    // opens a small panel offering "Accept All N Order(s)" and "Accept Orders
+    // Partially". So this tab needs two clicks per row, and we always take the
+    // full-accept option.
+    findRows() {
+      return [...document.querySelectorAll('[data-testid="accordion-header"]')]
+        .filter(h => /^accept orders?/i.test(txt(h)) && isVisible(h) && !isDisabled(h))
+        .map(h => {
+          const ctx = rowContextFor(h);
+          return ctx ? { el: h, ctx, sku: skuOf(ctx.text) } : null;
+        })
+        .filter(Boolean);
+    },
+    async act(pick) {
+      await humanClick(pick.el);                       // open the row's panel
+      const scope = pick.el.closest('[data-testid^="accordion-component"]')
+                 || pick.el.parentElement;
+      const btn = await waitFor(() => [...scope.querySelectorAll('button')].find(b =>
+        /^accept all \d+ orders?$/i.test(txt(b)) && isVisible(b) && !isDisabled(b)), 8000);
+      if (!btn) { await log('  panel did not offer "Accept All ..." — skipping'); return false; }
+      await log('  panel open → "' + txt(btn) + '"');
+      await humanClick(btn);
+      return true;
+    },
   },
 };
 
@@ -92,6 +114,17 @@ async function humanPause(min, max) {
   await sleep(ms);
 }
 
+// Polls until `fn()` returns something truthy, or the timeout runs out.
+async function waitFor(fn, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const v = fn();
+    if (v) return v;
+    if (Date.now() > deadline) return null;
+    await sleep(250);
+  }
+}
+
 const txt = el => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
 
 function isVisible(el) {
@@ -117,7 +150,7 @@ function isDisabled(el) {
 // told apart, on top of the disabled check.
 function rowContextFor(el) {
   let node = el;
-  for (let i = 0; i < 8 && node; i++) {
+  for (let i = 0; i < 10 && node; i++) {
     node = node.parentElement;
     if (!node) break;
     const t = txt(node);
@@ -139,6 +172,7 @@ function skuOf(rowText) {
 }
 
 function actionRowButtons(mode) {
+  if (mode.findRows) return mode.findRows();
   const nodes = [...document.querySelectorAll('button, a, [role="button"]')];
   const out = [];
   for (const el of nodes) {
@@ -371,10 +405,11 @@ function buildPanel(mode) {
     for (let i = 0; i < Math.min(3, btns.length); i++) {
       await log('  [' + i + '] SKU "' + btns[i].sku + '" | ' + btns[i].ctx.text.slice(0, 70));
     }
-    const all = [...document.querySelectorAll('button, a, [role="button"]')]
-      .filter(e => { const t = txt(e).toLowerCase();
-        return mode.match ? mode.match(t) : mode.labels.indexOf(t) !== -1; });
-    await log('  matching elements on page = ' + all.length + ' (usable rows = ' + btns.length + ')');
+    if (!mode.findRows) {
+      const all = [...document.querySelectorAll('button, a, [role="button"]')]
+        .filter(e => mode.labels.indexOf(txt(e).toLowerCase()) !== -1);
+      await log('  matching elements on page = ' + all.length + ' (usable rows = ' + btns.length + ')');
+    }
   };
 }
 
@@ -627,7 +662,12 @@ async function runLoop(mode) {
 
       await log('click ' + (s.done + 1) + '/' + s.limit + ' → ' + label);
       const before = readPendingCount(mode);
-      await humanClick(pick.el);
+      if (mode.act) {
+        const acted = await mode.act(pick);
+        if (!acted) { await humanPause(1200, 2500); continue; }
+      } else {
+        await humanClick(pick.el);
+      }
       await confirmModalIfAny();
 
       // Success = that row's button left the screen, or the tab counter dropped.
