@@ -54,7 +54,7 @@ const MODES = {
     // full-accept option.
     findRows() {
       return [...document.querySelectorAll('[data-testid="accordion-header"]')]
-        .filter(h => /^accept orders?/i.test(txt(h)) && isVisible(h) && !isDisabled(h))
+        .filter(h => /^accept orders?/i.test(txt(h)) && isVisible(h) && !isDisabled(h))
         .map(h => {
           const ctx = rowContextFor(h);
           return ctx ? { el: h, ctx, sku: skuOf(ctx.text) } : null;
@@ -212,7 +212,7 @@ function readPendingCount(mode) {
 function isEmptyState() {
   return [...document.querySelectorAll('div, p, span, h1, h2, h3')].some(el => {
     const t = txt(el);
-    return t.length < 60 && /^No orders/i.test(t) && isVisible(el);
+    return t.length < 60 && /^No orders/i.test(t) && isVisible(el);
   });
 }
 
