@@ -173,6 +173,15 @@ function readPendingCount(mode) {
   return null;
 }
 
+// Flipkart's own empty-state artwork, e.g. "No orders to accept" / "No orders
+// to pack". Its exact wording differs per tab, so only the shape is matched.
+function isEmptyState() {
+  return [...document.querySelectorAll('div, p, span, h1, h2, h3')].some(el => {
+    const t = txt(el);
+    return t.length < 60 && /^No orders/i.test(t) && isVisible(el);
+  });
+}
+
 function isLoggedOut() {
   const url = location.href, title = (document.title || '').toLowerCase();
   return url.includes('/login') || url.includes('/signin')
@@ -575,7 +584,10 @@ async function runLoop(mode) {
       const rows = await waitForRows(mode);
       if (rows === 'LOGGED_OUT') continue;
       if (!rows.length) {
-        if (readPendingCount(mode) === 0) {
+        // Once the tab is empty Flipkart drops the counter chip altogether and
+        // shows its "No orders ..." artwork, so a null count is not a failure —
+        // check the empty-state message before treating this as a stalled page.
+        if (readPendingCount(mode) === 0 || isEmptyState()) {
           s.running = false; await setState(s);
           await log('DONE — nothing left on this tab.');
           break;
