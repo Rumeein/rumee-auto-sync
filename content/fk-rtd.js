@@ -45,6 +45,9 @@ const MODES = {
     title:  'Accept orders',
     verb:   'Accept',
     labels: ['accept', 'accept order', 'accept orders'],
+    // Jaiswal recalls the button reading "Accept Order"/"Accept Orders"; allow a
+    // trailing count too, e.g. "Accept Orders (2)", which an exact match misses.
+    match:  t => /^accept(\s+orders?)?(\s*\(\d+\))?$/i.test(t),
     tiles:  ['To Accept'],
     skuFilter: true,
   },
@@ -140,7 +143,7 @@ function actionRowButtons(mode) {
   const out = [];
   for (const el of nodes) {
     const t = txt(el).toLowerCase();
-    if (mode.labels.indexOf(t) === -1) continue;
+    if (!(mode.match ? mode.match(t) : mode.labels.indexOf(t) !== -1)) continue;
     if (!isVisible(el) || isDisabled(el)) continue;
     const ctx = rowContextFor(el);
     if (!ctx) continue;                       // toolbar / bulk button — skip
@@ -360,7 +363,8 @@ function buildPanel(mode) {
       await log('  [' + i + '] SKU "' + btns[i].sku + '" | ' + btns[i].ctx.text.slice(0, 70));
     }
     const all = [...document.querySelectorAll('button, a, [role="button"]')]
-      .filter(e => mode.labels.indexOf(txt(e).toLowerCase()) !== -1);
+      .filter(e => { const t = txt(e).toLowerCase();
+        return mode.match ? mode.match(t) : mode.labels.indexOf(t) !== -1; });
     await log('  matching elements on page = ' + all.length + ' (usable rows = ' + btns.length + ')');
   };
 }
