@@ -1628,7 +1628,7 @@ function trackLabelDownload(id) {
         return;
       }
       if (Date.now() > deadline) {
-        reportLabelResult({ ok: false, reason: 'download did not finish within 30s' });
+        reportLabelResult({ ok: false, reason: 'no file after 30s — a Save-As box is probably waiting on screen' });
         return;
       }
       setTimeout(poll, 700);
@@ -1659,13 +1659,20 @@ chrome.downloads.onCreated.addListener((item) => {
   if (_labelArmedAt && Date.now() - _labelArmedAt < LABEL_ARM_WINDOW_MS) {
     _labelArmedAt = 0;
     const url = item.url || '';
-    chrome.downloads.cancel(item.id, () => { chrome.downloads.erase({ id: item.id }, () => {}); });
     console.log(`[Rumee] downloads.onCreated (label): ${url.slice(0, 120)}`);
+
+    // Flipkart builds the label inside the page and hands Chrome a blob: url,
+    // which belongs to that page — the extension cannot fetch it. Cancelling it
+    // would destroy the only copy, so leave Chrome to save it and just report
+    // where it landed. (With "Ask where to save each file" off, that is silent
+    // and this mode needs nothing further; with it on, Chrome shows the box and
+    // the wait below times out saying so.)
     if (url.startsWith('blob:')) {
-      // A blob belongs to the page that made it; the extension cannot fetch it.
-      reportLabelResult({ ok: false, reason: 'label is built inside the page (blob), so it cannot be re-downloaded — turn off Chrome\'s "Ask where to save each file" instead' });
+      trackLabelDownload(item.id);
       return;
     }
+
+    chrome.downloads.cancel(item.id, () => { chrome.downloads.erase({ id: item.id }, () => {}); });
     chrome.downloads.download({ url, saveAs: false }, (id) => {
       if (chrome.runtime.lastError || id == null) {
         reportLabelResult({ ok: false, reason: (chrome.runtime.lastError && chrome.runtime.lastError.message) || 'download refused' });
