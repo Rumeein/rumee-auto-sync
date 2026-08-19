@@ -7,11 +7,15 @@
 // randomised pacing so it behaves like a person working through the list rather
 // than a burst of scripted clicks.
 //
-// Two modes, picked automatically from the page URL:
-//   pendingToPack   → clicks "Mark RTD" on each row
-//   pendingToAccept → clicks "Accept" on each row, optionally only for the SKUs
-//                     ticked in the panel (Scan SKUs lists every SKU on the tab
-//                     with its order count first)
+// Three modes, picked automatically from the page:
+//   To Pack / Pending RTD   → clicks "Mark RTD" on each row
+//   To Pack / Pending Label → clicks "Print Labels" on each row, in batches of
+//                             whatever "Stop after" is set to
+//   To Accept               → clicks "Accept" on each row, optionally only for
+//                             the SKUs ticked in the panel (Scan SKUs lists every
+//                             SKU on the tab with its order count first)
+// The two To Pack sub-tabs share one URL, so those two are told apart by which
+// row buttons are on screen, re-checked every few seconds while idle.
 //
 // It is NOT part of the daily sync and never auto-starts — only the Start button
 // on its own on-page panel begins a run. State lives in chrome.storage.local so a
@@ -22,7 +26,7 @@ window.__rumeeRtdInjected = true;
 
 'use strict';
 
-const BUILD      = '2026-08-19d';  // shown in the log so it is obvious which build a tab is running
+const BUILD      = '2026-08-19e';  // shown in the log so it is obvious which build a tab is running
 const STATE_KEY  = 'fkRtdBot';
 const LOG_KEY    = 'fkRtdLog';
 const UI_KEY     = 'fkRtdUi';      // panel position + collapsed state
@@ -39,6 +43,26 @@ const MODES = {
     labels: ['mark rtd', 'mark as rtd', 'mark ready to dispatch'],
     tiles:  ['Pending RTD', 'To Pack'],
     skuFilter: false,
+  },
+  // The Pending Label sub-tab lives on the SAME url as Pending RTD, so this mode
+  // is chosen by what is actually on screen (see currentMode). Measured live
+  // 2026-08-19: the row control is a real enabled BUTTON reading "Print Labels";
+  // the bulk one in the toolbar is disabled and covers the whole table, so the
+  // existing row/bulk rules already exclude it.
+  label: {
+    id:     'label',
+    tabKey: 'pendingToPack',
+    title:  'Print labels',
+    verb:   'Print Labels',
+    labels: ['print labels', 'print label'],
+    tiles:  ['Pending Label'],
+    skuFilter: false,
+    // Printing may open a viewer or start a download, either of which takes a
+    // moment longer than a plain button press.
+    confirmWaitMs: 20000,
+    // Whether the row vanishes on its own is unknown, and a re-render would look
+    // exactly like success — so only a drop in the Pending Label count counts.
+    verifyByCounter: true,
   },
   accept: {
     id:     'accept',
@@ -99,8 +123,17 @@ function currentMode() {
   const h = decodeURIComponent(location.hash || '');
   if (!/active-orders/i.test(h)) return null;
   if (new RegExp(MODES.accept.tabKey, 'i').test(h)) return MODES.accept;
-  if (new RegExp(MODES.pack.tabKey,   'i').test(h)) return MODES.pack;
+  if (new RegExp(MODES.pack.tabKey,   'i').test(h)) return packSubTab();
   return null;
+}
+
+// "Pending Label" and "Pending RTD" share one url, so the url cannot tell them
+// apart — the rows can. An enabled row-level "Print Labels" button only exists on
+// the Pending Label sub-tab (the toolbar's own copy is always disabled).
+function packSubTab() {
+  const onLabelTab = [...document.querySelectorAll('button')].some(b =>
+    /^print labels?$/i.test(txt(b)) && !b.disabled && isVisible(b) && rowContextFor(b));
+  return onLabelTab ? MODES.label : MODES.pack;
 }
 
 // Pacing (milliseconds). Every wait is randomised around these — never a fixed beat.
@@ -747,14 +780,15 @@ async function runLoop(mode) {
       await confirmModalIfAny();
 
       // Success = that row's button left the screen, or the tab counter dropped.
-      const deadline = Date.now() + PACE.confirmWaitMs;
+      const deadline = Date.now() + (mode.confirmWaitMs || PACE.confirmWaitMs);
       let ok = false;
       while (Date.now() < deadline) {
         await sleep(500);
         // On a tab where opening a row re-renders it, the clicked element detaches
         // whether or not anything was accepted — so there the counter is the only
         // honest signal. Elsewhere the row leaving the screen is the signal.
-        if (!mode.act && (!document.contains(pick.el) || !isVisible(pick.el))) { ok = true; break; }
+        const rowGone = !document.contains(pick.el) || !isVisible(pick.el);
+        if (!mode.act && !mode.verifyByCounter && rowGone) { ok = true; break; }
         const after = readPendingCount(mode);
         if (before != null && after != null && after < before) { ok = true; break; }
       }
@@ -826,6 +860,14 @@ async function runLoop(mode) {
   };
   await mount();
   window.addEventListener('hashchange', () => setTimeout(mount, 1200));
+  // Pending Label and Pending RTD share a url, so switching between them fires no
+  // hashchange — notice the swap by watching what is on screen, but never while a
+  // run is in progress.
+  setInterval(() => {
+    if (looping || !panel) return;
+    const m = currentMode();
+    if (m && panel.__rumeeMode !== m.id) mount();
+  }, 3000);
 })();
 
 }
