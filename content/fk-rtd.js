@@ -26,7 +26,7 @@ window.__rumeeRtdInjected = true;
 
 'use strict';
 
-const BUILD      = '2026-08-19h';  // shown in the log so it is obvious which build a tab is running
+const BUILD      = '2026-08-19i';  // shown in the log so it is obvious which build a tab is running
 const DRY_RUN    = false;          // set true to make Start only report what it would click
 const STATE_KEY  = 'fkRtdBot';
 const LOG_KEY    = 'fkRtdLog';
@@ -57,7 +57,9 @@ const MODES = {
     verb:   'Print Labels',
     labels: ['print labels', 'print label'],
     tiles:  ['Pending Label'],
-    skuFilter: false,
+    // Same SKU picker as the Accept tab: Scan SKUs lists every SKU waiting for a
+    // label with its order count, and only the ticked ones get printed.
+    skuFilter: true,
     // Printing may open a viewer or start a download, either of which takes a
     // moment longer than a plain button press.
     confirmWaitMs: 20000,
