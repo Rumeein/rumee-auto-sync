@@ -26,7 +26,8 @@ window.__rumeeRtdInjected = true;
 
 'use strict';
 
-const BUILD      = '2026-08-19g';  // shown in the log so it is obvious which build a tab is running
+const BUILD      = '2026-08-19h';  // shown in the log so it is obvious which build a tab is running
+const DRY_RUN    = false;          // set true to make Start only report what it would click
 const STATE_KEY  = 'fkRtdBot';
 const LOG_KEY    = 'fkRtdLog';
 const UI_KEY     = 'fkRtdUi';      // panel position + collapsed state
@@ -385,7 +386,9 @@ function buildPanel(mode) {
         + '  <div class="skus" id="__rtdSkus"></div>'
         + '  <div class="hint" id="__rtdHint">Scan first, then tick the SKUs to accept. Nothing ticked = all of them.</div>'
       : ''),
-    '  <div class="row"><label><input type="checkbox" id="__rtdDry" checked> Dry run (no clicks)</label></div>',
+    // Dry run tick box removed once all three modes were proven live. The dry-run
+    // branch in the loop is left in place — flip DRY_RUN to true to get it back.
+
     '  <div class="row"><label>Stop after <input type="number" id="__rtdLimit" min="1" value="50"> orders</label></div>',
     '  <div class="row">',
     '    <button class="go" id="__rtdStart">Start</button>',
@@ -459,7 +462,7 @@ function buildPanel(mode) {
   }
 
   panel.querySelector('#__rtdStart').onclick = async () => {
-    const dryRun = panel.querySelector('#__rtdDry').checked;
+    const dryRun = DRY_RUN;
     const limit  = parseInt(panel.querySelector('#__rtdLimit').value, 10) || 1;
     if (mode.skuFilter) await setFilter(mode, tickedSkus());
     const picked = mode.skuFilter ? await getFilter(mode) : [];
